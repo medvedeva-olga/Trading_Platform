@@ -1,0 +1,18 @@
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+known_first_party = ["app", "src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    "smoke: быстрые проверки критического пути",
+    "copy: копитрейдинг",
+    "websocket: потоковые события",
+]

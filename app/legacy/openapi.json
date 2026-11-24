@@ -1,0 +1,581 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Mock Trading Server",
+    "description": "\nIn-memory моковый торговый сервер для автоматизации тестирования REST и WebSocket API.\n\n## Возможности\n\n* Заявки исполняются мгновенно по переданной цене (без стакана и очередей).\n* Экспозиция и позиции хранятся в памяти процесса и защищены `asyncio.Lock`.\n* После каждого исполненного ордера изменение экспозиции рассылается всем\n  WebSocket-подписчикам соответствующего счета.\n* `POST /api/v1/reset` полностью очищает состояние — удобно для изоляции автотестов.\n\n## Модель экспозиции\n\n```\nBUY:  exposure += quantity * price\nSELL: exposure -= quantity * price\n```\n\nПозиция по тикеру меняется на `+quantity` для `BUY` и `-quantity` для `SELL`.\nВнутренние расчеты выполняются в `Decimal`, наружу значения отдаются как `float`.\n\n## WebSocket-контракт\n\nOpenAPI не описывает WebSocket, поэтому контракт зафиксирован здесь\n(и в vendor-расширении `x-websocket-endpoints`).\n\n**URL:** `ws://localhost:8000/ws/exposure/{account_id}`\n\n1. Сразу после подключения сервер отправляет snapshot — схема `ExposureSnapshot`.\n2. После каждого `POST /api/v1/orders` по этому счету приходит событие\n   `ExposureUpdate` c `event: \"EXPOSURE_UPDATE\"`.\n3. Рассылка изолирована по `account_id`; отключенные клиенты удаляются из реестра.\n\nПример события:\n\n```json\n{\n  \"event\": \"EXPOSURE_UPDATE\",\n  \"account_id\": \"ACC-123\",\n  \"total_exposure\": 1500.50,\n  \"delta\": 500.50,\n  \"last_order_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"timestamp\": \"2026-11-18T10:00:00.000Z\"\n}\n```\n\n## Типовой сценарий теста\n\n1. `POST /api/v1/reset` — очистить состояние.\n2. Подключиться к `ws://.../ws/exposure/{account_id}`, дождаться snapshot.\n3. `POST /api/v1/orders` — создать заявку.\n4. Проверить `EXPOSURE_UPDATE` из WebSocket и сверить с\n   `GET /api/v1/accounts/{account_id}/exposure`.\n",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000",
+      "description": "Локальный запуск (по умолчанию)"
+    }
+  ],
+  "paths": {
+    "/api/v1/orders": {
+      "post": {
+        "tags": [
+          "trading"
+        ],
+        "summary": "Создать и мгновенно исполнить заявку",
+        "description": "Исполняет заявку по переданной цене, обновляет экспозицию и позицию по тикеру, затем рассылает `EXPOSURE_UPDATE` подписчикам счета.\n\n**Ответ 422** возвращается при невалидном теле запроса: `quantity <= 0`, `price <= 0`, неизвестный `side` и т.п.",
+        "operationId": "createOrder",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Заявка исполнена, возвращены ее поля и присвоенный `order_id`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Ошибка валидации тела запроса.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                },
+                "example": {
+                  "detail": [
+                    {
+                      "type": "greater_than",
+                      "loc": [
+                        "body",
+                        "quantity"
+                      ],
+                      "msg": "Input should be greater than 0",
+                      "input": 0,
+                      "ctx": {
+                        "gt": 0
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/accounts/{account_id}/exposure": {
+      "get": {
+        "tags": [
+          "risk"
+        ],
+        "summary": "Получить текущую экспозицию счета",
+        "description": "Возвращает текущее состояние счета: суммарную экспозицию и позиции по тикерам.\n\nДля неизвестного счета возвращает `total_exposure = 0.0` и пустой `positions` (запись в памяти не создается).\n\nДанные совпадают с первым WebSocket-сообщением (`EXPOSURE_SNAPSHOT`) — удобно для сверки REST и WS.",
+        "operationId": "getAccountExposure",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Идентификатор счета.",
+              "examples": [
+                "ACC-123"
+              ],
+              "title": "Account Id"
+            },
+            "description": "Идентификатор счета."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Текущее состояние счета.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountExposure"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/reset": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Сбросить все состояние сервера",
+        "description": "Удаляет все счета, их экспозиции и позиции из памяти процесса.\n\nАктивные WebSocket-соединения не закрываются: следующие заявки снова начнут присылать консистентные обновления. Для получения свежего snapshot после сброса переподключитесь или запросите REST-эндпоинт экспозиции.",
+        "operationId": "resetState",
+        "responses": {
+          "200": {
+            "description": "Количество очищенных счетов.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Проверка доступности сервера",
+        "description": "Liveness-проба. Используйте для ожидания готовности сервера в тестах.",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountExposure": {
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "title": "Account Id",
+            "description": "Идентификатор счета."
+          },
+          "total_exposure": {
+            "type": "number",
+            "title": "Total Exposure",
+            "description": "Суммарная рыночная стоимость открытых позиций: `sum(quantity * price)` с учетом знака."
+          },
+          "positions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Positions",
+            "description": "Открытые позиции по тикерам: `{symbol: quantity}`. Нулевые позиции сохраняются."
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_id",
+          "total_exposure",
+          "positions"
+        ],
+        "title": "AccountExposure",
+        "description": "Текущее состояние счета (REST).",
+        "examples": [
+          {
+            "account_id": "ACC-123",
+            "positions": {
+              "AAPL": 10
+            },
+            "total_exposure": 1500.5
+          }
+        ]
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok",
+            "title": "Status",
+            "default": "ok"
+          }
+        },
+        "type": "object",
+        "title": "HealthResponse"
+      },
+      "OrderCreate": {
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Account Id",
+            "description": "Идентификатор счета (1-64 символа).",
+            "examples": [
+              "ACC-123"
+            ]
+          },
+          "symbol": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Symbol",
+            "description": "Тикер инструмента (1-32 символа), например `AAPL`.",
+            "examples": [
+              "AAPL"
+            ]
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Side",
+            "description": "Направление сделки: `BUY` или `SELL` (регистр важен)."
+          },
+          "quantity": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Quantity",
+            "description": "Количество бумаг, строго больше 0.",
+            "examples": [
+              10
+            ]
+          },
+          "price": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Price",
+            "description": "Цена мгновенного исполнения, строго больше 0.",
+            "examples": [
+              150.05
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "account_id",
+          "symbol",
+          "side",
+          "quantity",
+          "price"
+        ],
+        "title": "OrderCreate",
+        "description": "Тело запроса на создание торговой заявки.",
+        "examples": [
+          {
+            "account_id": "ACC-123",
+            "price": 150.05,
+            "quantity": 10,
+            "side": "BUY",
+            "symbol": "AAPL"
+          }
+        ]
+      },
+      "OrderResponse": {
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Order Id",
+            "description": "Уникальный идентификатор заявки (UUID4)."
+          },
+          "status": {
+            "type": "string",
+            "const": "FILLED",
+            "title": "Status",
+            "description": "Статус заявки; всегда `FILLED`.",
+            "default": "FILLED"
+          },
+          "timestamp": {
+            "type": "string",
+            "title": "Timestamp",
+            "description": "Время исполнения в формате ISO 8601 (UTC, суффикс `Z`)."
+          },
+          "account_id": {
+            "type": "string",
+            "title": "Account Id",
+            "description": "Идентификатор счета из запроса."
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol",
+            "description": "Тикер из запроса."
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "title": "Side",
+            "description": "Направление сделки из запроса."
+          },
+          "quantity": {
+            "type": "integer",
+            "title": "Quantity",
+            "description": "Количество бумаг из запроса."
+          },
+          "price": {
+            "type": "number",
+            "title": "Price",
+            "description": "Цена исполнения из запроса."
+          }
+        },
+        "type": "object",
+        "required": [
+          "order_id",
+          "timestamp",
+          "account_id",
+          "symbol",
+          "side",
+          "quantity",
+          "price"
+        ],
+        "title": "OrderResponse",
+        "description": "Подтверждение мгновенно исполненной заявки.",
+        "examples": [
+          {
+            "account_id": "ACC-123",
+            "order_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "price": 150.05,
+            "quantity": 10,
+            "side": "BUY",
+            "status": "FILLED",
+            "symbol": "AAPL",
+            "timestamp": "2026-11-18T10:00:00.000Z"
+          }
+        ]
+      },
+      "ResetResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "ok",
+            "title": "Status",
+            "description": "Всегда `ok`.",
+            "default": "ok"
+          },
+          "accounts_cleared": {
+            "type": "integer",
+            "title": "Accounts Cleared",
+            "description": "Количество удаленных счетов."
+          }
+        },
+        "type": "object",
+        "required": [
+          "accounts_cleared"
+        ],
+        "title": "ResetResponse",
+        "description": "Результат сброса состояния."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "ExposureSnapshot": {
+        "description": "Первое WebSocket-сообщение сразу после подключения клиента.",
+        "examples": [
+          {
+            "account_id": "ACC-123",
+            "event": "EXPOSURE_SNAPSHOT",
+            "positions": {
+              "AAPL": 10
+            },
+            "timestamp": "2026-11-18T10:00:00.000Z",
+            "total_exposure": 1505.0
+          }
+        ],
+        "properties": {
+          "event": {
+            "const": "EXPOSURE_SNAPSHOT",
+            "default": "EXPOSURE_SNAPSHOT",
+            "description": "Тип события: `EXPOSURE_SNAPSHOT`.",
+            "title": "Event",
+            "type": "string"
+          },
+          "account_id": {
+            "description": "Идентификатор счета.",
+            "title": "Account Id",
+            "type": "string"
+          },
+          "total_exposure": {
+            "description": "Текущая суммарная экспозиция счета.",
+            "title": "Total Exposure",
+            "type": "number"
+          },
+          "positions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "Текущие позиции по тикерам: `{symbol: quantity}`.",
+            "title": "Positions",
+            "type": "object"
+          },
+          "timestamp": {
+            "description": "Время формирования snapshot (ISO 8601, UTC).",
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "total_exposure",
+          "positions",
+          "timestamp"
+        ],
+        "title": "ExposureSnapshot",
+        "type": "object"
+      },
+      "ExposureUpdate": {
+        "description": "WebSocket-событие, отправляемое после каждого исполненного ордера.",
+        "examples": [
+          {
+            "account_id": "ACC-123",
+            "delta": 500.5,
+            "event": "EXPOSURE_UPDATE",
+            "last_order_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "timestamp": "2026-11-18T10:00:00.000Z",
+            "total_exposure": 1500.5
+          }
+        ],
+        "properties": {
+          "event": {
+            "const": "EXPOSURE_UPDATE",
+            "default": "EXPOSURE_UPDATE",
+            "description": "Тип события: `EXPOSURE_UPDATE`.",
+            "title": "Event",
+            "type": "string"
+          },
+          "account_id": {
+            "description": "Идентификатор счета, по которому изменилась экспозиция.",
+            "title": "Account Id",
+            "type": "string"
+          },
+          "total_exposure": {
+            "description": "Экспозиция счета после исполнения заявки.",
+            "title": "Total Exposure",
+            "type": "number"
+          },
+          "delta": {
+            "description": "Изменение экспозиции: `+quantity * price` для `BUY`, `-quantity * price` для `SELL`.",
+            "title": "Delta",
+            "type": "number"
+          },
+          "last_order_id": {
+            "description": "Идентификатор заявки, вызвавшей изменение.",
+            "format": "uuid",
+            "title": "Last Order Id",
+            "type": "string"
+          },
+          "timestamp": {
+            "description": "Время события (ISO 8601, UTC).",
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "total_exposure",
+          "delta",
+          "last_order_id",
+          "timestamp"
+        ],
+        "title": "ExposureUpdate",
+        "type": "object"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "trading",
+      "description": "Создание и мгновенное исполнение торговых заявок."
+    },
+    {
+      "name": "risk",
+      "description": "Просмотр текущей риск-экспозиции и позиций по счетам."
+    },
+    {
+      "name": "admin",
+      "description": "Служебные операции: сброс состояния и health-check."
+    }
+  ],
+  "x-websocket-endpoints": [
+    {
+      "path": "/ws/exposure/{account_id}",
+      "protocol": "websocket",
+      "description": "Snapshot (ExposureSnapshot) сразу после подключения, затем ExposureUpdate после каждого исполненного ордера по счету.",
+      "onConnect": {
+        "$ref": "#/components/schemas/ExposureSnapshot"
+      },
+      "onUpdate": {
+        "$ref": "#/components/schemas/ExposureUpdate"
+      }
+    }
+  ]
+}
