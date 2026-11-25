@@ -40,7 +40,6 @@ class TestSettings(BaseSettings):
     btc_amount: str = "0.10000000"
     eth_amount: str = "0.50000000"
 
-    MONEY_QUANTUM: ClassVar[str] = "0.00000001"
     ZERO: ClassVar[str] = "0.00000000"
 
     @property

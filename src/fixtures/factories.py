@@ -1,8 +1,11 @@
-from __future__ import annotations
-
 import uuid
 from decimal import Decimal
 from typing import Any
+
+from src.schemas.types import MONEY_QUANTUM
+
+LOW_FACTOR = Decimal("0.8")
+HIGH_FACTOR = Decimal("1.2")
 
 
 def unique_username(prefix: str) -> str:
@@ -14,14 +17,12 @@ def register_payload(username: str, password: str, role: str) -> dict[str, Any]:
 
 
 def corridor(
-    price: float, low_factor: float = 0.8, high_factor: float = 1.2
+    price: Decimal,
+    low_factor: Decimal = LOW_FACTOR,
+    high_factor: Decimal = HIGH_FACTOR,
 ) -> tuple[str, str]:
-    low = (Decimal(str(price)) * Decimal(str(low_factor))).quantize(
-        Decimal("0.00000001")
-    )
-    high = (Decimal(str(price)) * Decimal(str(high_factor))).quantize(
-        Decimal("0.00000001")
-    )
+    low = (price * low_factor).quantize(MONEY_QUANTUM)
+    high = (price * high_factor).quantize(MONEY_QUANTUM)
     return format(low, "f"), format(high, "f")
 
 

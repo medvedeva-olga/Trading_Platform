@@ -24,6 +24,7 @@ from src.messages import CopyTradingErrors, ErrCodes
 from src.schemas.copy_trading import CopyHistoryItem, MasterStats, SubscriptionResponse
 from src.schemas.market_data import TickerQuote
 from src.schemas.order import OrderResponse
+from src.schemas.types import MONEY_QUANTUM
 from tests.config import settings as qa
 
 
@@ -31,7 +32,7 @@ async def _master_buy(master) -> OrderResponse:
     quotes = expect_model_list(await master.client.tickers(), TickerQuote)
     btc = next((q for q in quotes if q.ticker == Ticker.BTCUSDT), None)
     assert btc is not None, f"{Ticker.BTCUSDT} ticker not found"
-    low, high = corridor(float(btc.ask))
+    low, high = corridor(btc.ask)
     response = await master.client.create_order(
         order_payload(
             ticker=Ticker.BTCUSDT,
@@ -299,7 +300,7 @@ async def test_copy_with_tight_slippage_is_skipped(master, slave):
                 allocation_usdt=qa.default_allocation,
                 copy_mode=CopyMode.FIXED_RATIO,
                 fixed_ratio="0.10000000",
-                max_slippage_percent="0.00000001",
+                max_slippage_percent=format(MONEY_QUANTUM, "f"),
             )
         ),
         SubscriptionResponse,
@@ -312,7 +313,7 @@ async def test_copy_with_tight_slippage_is_skipped(master, slave):
     assert history[0].status == CopyTradingStatus.SKIPPED
     assert history[0].skip_reason == SkipReason.SLIPPAGE_EXCEEDED
     assert history[0].slave_order_id is None
-    assert history[0].slippage_percent > Decimal("0.00000001")
+    assert history[0].slippage_percent > MONEY_QUANTUM
 
 
 async def test_copy_with_allocation_smaller_than_notional_is_skipped(

@@ -108,7 +108,7 @@ async def test_user_stream_pushes_balance_updated_after_deposit(runtime, master)
 async def test_user_stream_pushes_order_status_when_order_is_filled(runtime, master):
     quotes = expect_model_list(await master.client.tickers(), TickerQuote)
     btc = next(q for q in quotes if q.ticker == Ticker.BTCUSDT)
-    low, high = corridor(float(btc.ask))
+    low, high = corridor(btc.ask)
 
     async with open_user_stream(runtime.base_url, master.token) as socket:
         assert (await recv_json(socket))["event"] == WsEvent.CONNECTED
@@ -151,7 +151,7 @@ async def test_user_stream_pushes_copy_trade_result(runtime, master, slave):
     )
     quotes = expect_model_list(await master.client.tickers(), TickerQuote)
     btc = next(q for q in quotes if q.ticker == Ticker.BTCUSDT)
-    low, high = corridor(float(btc.ask))
+    low, high = corridor(btc.ask)
 
     async with open_user_stream(runtime.base_url, slave.token) as socket:
         assert (await recv_json(socket))["event"] == WsEvent.CONNECTED
