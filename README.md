@@ -109,7 +109,7 @@ poetry run flake8 app/ src/ tests/
 `portfolio` (экспозиция). Order-тесты проверяют полный цикл `IOC` / `GTC`,
 отмену с разморозкой, `stop_loss` / `take_profit`, стакан, `MARKET` / `LIMIT`,
 частичное исполнение, комиссии и price improvement. Экспозиционные тесты
-проверяют REST/WS-снимок и дельты при покупке и продаже. Всего в наборе 48
+проверяют REST/WS-снимок и дельты при покупке и продаже. Всего в наборе 49
 тестов, прогон зелёный.
 Тесты используют общего клиента, фабрики данных и доменные `StrEnum`-константы
 из `src/constants.py`.
@@ -248,7 +248,7 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
 | `GET` | `/api/v1/portfolio/exposure` | Знаковая экспозиция по открытым позициям |
 | `GET` | `/api/v1/market/tickers` | Bid / Ask / Last / Spread |
 | `GET` | `/api/v1/market/depth` | Стакан: `bids` / `asks` с объёмами |
-| `POST` | `/api/v1/orders` | Ордер (`LIMIT` / `MARKET`, `IOC` / `GTC`) |
+| `POST` | `/api/v1/orders` | Ордер (`LIMIT` с `IOC`/`GTC`, `MARKET` только с `IOC`) |
 | `GET` | `/api/v1/orders` | История ордеров пользователя |
 | `GET` | `/api/v1/orders/{id}` | Ордер по ID |
 | `DELETE` | `/api/v1/orders/{id}` | Отмена `NEW` / `PARTIALLY_FILLED` + разморозка |
@@ -270,6 +270,8 @@ QA-ручки стакана (`POST` / `DELETE /api/v1/test/depth`) доступ
   `PENDING` сохранён как устаревший псевдоним в схемах.
 * `IOC` без полного исполнения → `CANCELED` с `reason=IOC_PARTIALLY_FILLED` или
   `IOC_OUT_OF_RANGE`; остаток `GTC` остаётся в стакане с заморозкой средств.
+* `GTC` применяется только к `LIMIT`: сочетание `MARKET + GTC` отклоняется с
+  `400 MARKET_GTC_NOT_ALLOWED`, поскольку рыночный ордер не может «лежать» в стакане.
 * Комиссия `fee_rate` (0.1%) списывается с тейкера; исполнение по цене мейкера,
   лучшей чем лимит, отражается в `price_improvement`. Каждое совпадение пишется
   в таблицу `trades`.
@@ -305,7 +307,8 @@ QA-ручки стакана (`POST` / `DELETE /api/v1/test/depth`) доступ
 `INSUFFICIENT_POSITION`, `INVALID_TICKER`, `AMOUNT_TOO_SMALL`, `ORDER_NOT_FOUND`,
 `ORDER_NOT_CANCELABLE`, `MASTER_NOT_FOUND`, `NOT_A_MASTER`, `ROLE_NOT_ALLOWED`,
 `CANNOT_COPY_SELF`, `SUBSCRIPTION_ALREADY_EXISTS`, `MASTER_ID_IMMUTABLE`,
-`FORBIDDEN`. Auth/валидация — стандартные `401` / `422` с полем `detail`.
+`MARKET_GTC_NOT_ALLOWED`, `FORBIDDEN`.
+Auth/валидация — стандартные `401` / `422` с полем `detail`.
 
 ---
 

@@ -569,6 +569,12 @@ class TradingEngine:
                 "AMOUNT_TOO_SMALL",
                 f"Order amount must be at least {settings.min_order_amount}.",
             )
+        if data.order_type == "MARKET" and data.time_in_force == "GTC":
+            raise BusinessError(
+                "MARKET_GTC_NOT_ALLOWED",
+                "MARKET orders require IOC; use LIMIT with GTC to rest an order.",
+                status_code=400,
+            )
 
         async with self._lock, SessionLocal() as session:
             user = await session.get(User, user_id)

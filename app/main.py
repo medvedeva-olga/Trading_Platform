@@ -123,8 +123,9 @@ APP_DESCRIPTION = """
 3. `POST /api/v1/portfolio/deposit` — пополните баланс (100 … 1 000 000 USDT).
 4. `GET /api/v1/market/tickers` — возьмите текущие Bid/Ask и постройте ценовой коридор.
 5. `GET /api/v1/market/depth?ticker=BTCUSDT` — посмотрите лучшие уровни стакана.
-6. `POST /api/v1/orders` — выставьте `LIMIT` (лимит по коридору) или `MARKET`
-   (исполнение по лучшей цене стакана), с `IOC` или `GTC`.
+6. `POST /api/v1/orders` — выставьте `LIMIT` (лимит по коридору, `IOC` или `GTC`)
+   или `MARKET` (исполнение по лучшей цене стакана, только `IOC`);
+   `MARKET + GTC` отклоняется с `400 MARKET_GTC_NOT_ALLOWED`.
 7. `GET /api/v1/portfolio/exposure` — знаковая экспозиция по открытым позициям.
 8. `POST /api/v1/copy-trading/subscribe` — подпишите `SLAVE` на `MASTER`.
 9. `GET /api/v1/copy-trading/history` — проверьте `EXECUTED` / `SKIPPED` и причину.
@@ -135,7 +136,8 @@ APP_DESCRIPTION = """
   `NEW` / `PARTIALLY_FILLED` ордера. Приоритет — лучшая цена, затем время.
 * Частичное исполнение переводит ордер в `PARTIALLY_FILLED`; остаток `GTC`
   остаётся в стакане с заморозкой, остаток `IOC` отменяется с причиной
-  `IOC_PARTIALLY_FILLED` / `IOC_OUT_OF_RANGE`.
+  `IOC_PARTIALLY_FILLED` / `IOC_OUT_OF_RANGE`. `GTC` допустим только для `LIMIT`,
+  `MARKET + GTC` → `400 MARKET_GTC_NOT_ALLOWED`.
 * Taker платит комиссию `fee_rate` (по умолчанию 0.1%). Исполнение дешевле лимита
   BUY (или дороже лимита SELL) фиксируется в `price_improvement`.
 * Событие `order_status` дополнительно содержит `filled_qty`, `fee_amount`,
@@ -522,10 +524,11 @@ async def depth(
     summary="Создать ордер (LIMIT/MARKET, IOC/GTC)",
     description=(
         "`LIMIT` исполняется только в коридоре `min_price..max_price`, `MARKET` — по лучшей "
-        "цене стакана. Частичное исполнение даёт `PARTIALLY_FILLED`; остаток `IOC` отменяется "
-        "с `reason=IOC_PARTIALLY_FILLED` / `IOC_OUT_OF_RANGE`, остаток `GTC` остаётся в стакане "
-        "с заморозкой в `frozen_balance`. Тейкер платит комиссию `fee_rate`; разница с лимитом "
-        "фиксируется в `price_improvement`."
+        "цене стакана. `GTC` применим только к `LIMIT`; `MARKET + GTC` отклоняется с "
+        "`400 MARKET_GTC_NOT_ALLOWED`. Частичное исполнение даёт `PARTIALLY_FILLED`; остаток "
+        "`IOC` отменяется с `reason=IOC_PARTIALLY_FILLED` / `IOC_OUT_OF_RANGE`, остаток `GTC` "
+        "остаётся в стакане с заморозкой в `frozen_balance`. Тейкер платит комиссию `fee_rate`; "
+        "разница с лимитом фиксируется в `price_improvement`."
     ),
     responses=errors(400, 401, 403, 404, 422),
 )

@@ -419,7 +419,10 @@ class OrderCreateRequest(BaseModel):
     )
     order_type: OrderType = Field(
         default="LIMIT",
-        description="`LIMIT` respects the corridor; `MARKET` matches any available price.",
+        description=(
+            "`LIMIT` respects the corridor and accepts `IOC`/`GTC`; `MARKET` matches any "
+            "available price and requires `IOC` (`MARKET` + `GTC` returns 400)."
+        ),
     )
     amount: Money = Field(
         gt=0, examples=["0.10000000"], description="Amount in base asset."
@@ -436,7 +439,10 @@ class OrderCreateRequest(BaseModel):
     )
     time_in_force: TimeInForce = Field(
         examples=["GTC"],
-        description="`IOC`: fill now or cancel; `GTC`: wait for the price to enter the corridor.",
+        description=(
+            "`IOC`: fill now or cancel; `GTC`: wait for the price to enter the corridor "
+            "(LIMIT orders only)."
+        ),
     )
     stop_loss: Money | None = Field(default=None, gt=0, examples=["62000.00000000"])
     take_profit: Money | None = Field(default=None, gt=0, examples=["70000.00000000"])

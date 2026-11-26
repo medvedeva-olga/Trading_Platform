@@ -10,9 +10,9 @@ from src.clients.validators import (
     expect_status,
     expect_validation_error,
 )
-from src.constants import OrderSide, OrderStatus, Ticker, TimeInForce
+from src.constants import OrderSide, OrderStatus, OrderType, Ticker, TimeInForce
 from src.fixtures import corridor, order_payload
-from src.messages import OrderError
+from src.messages import ErrCodes, OrderError
 from src.schemas.market_data import TickerQuote
 from src.schemas.order import OrderResponse
 from src.schemas.portfolio import PortfolioSummary
@@ -97,6 +97,27 @@ async def test_create_gtc_order_outside_corridor_reserves_funds(master):
         expected=HTTPStatus.OK,
     )
     assert summary.frozen_balance == order.reserved_amount
+
+
+async def test_create_market_gtc_order_returns_400(master):
+    quote = await _btc_quote(master.client)
+    low, high = corridor(quote.ask)
+
+    response = await master.client.create_order(
+        order_payload(
+            ticker=Ticker.BTCUSDT,
+            side=OrderSide.BUY,
+            amount=qa.btc_amount,
+            min_price=low,
+            max_price=high,
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.GTC,
+        )
+    )
+
+    expect_custom_error(
+        response, ErrCodes.MARKET_GTC_NOT_ALLOWED, status=HTTPStatus.BAD_REQUEST
+    )
 
 
 async def test_create_order_with_reversed_corridor_returns_422(master):
