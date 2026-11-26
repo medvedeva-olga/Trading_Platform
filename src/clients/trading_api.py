@@ -57,6 +57,9 @@ class TradingAPIClient:
     async def portfolio_summary(self) -> httpx.Response:
         return await self._http.get("/api/v1/portfolio/summary", headers=self.headers)
 
+    async def exposure(self) -> httpx.Response:
+        return await self._http.get("/api/v1/portfolio/exposure", headers=self.headers)
+
     async def tickers(self) -> httpx.Response:
         return await self._http.get("/api/v1/market/tickers", headers=self.headers)
 

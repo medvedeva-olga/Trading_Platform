@@ -88,3 +88,16 @@ class PortfolioSummary(BaseModel):
             ]
         }
     )
+
+
+class ExposurePosition(BaseModel):
+    ticker: str
+    quantity: MoneyStr
+    mark_price: MoneyStr
+    exposure: MoneyStr
+
+
+class AccountExposure(BaseModel):
+    user_id: int
+    total_exposure: MoneyStr
+    positions: list[ExposurePosition]

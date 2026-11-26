@@ -32,6 +32,7 @@ from .config import TICKERS, create_access_token, decode_access_token, money, se
 from .database import close_engine, init_db
 from .market_feed import MarketFeed, Quote
 from .schemas import (
+    AccountExposure,
     BalanceUpdatedEvent,
     BusinessError,
     CopyHistoryItem,
@@ -43,6 +44,8 @@ from .schemas import (
     DepthOverride,
     DepthResponse,
     ErrorResponse,
+    ExposureSnapshotEvent,
+    ExposureUpdatedEvent,
     LoginRequest,
     MasterStats,
     OrderCreateRequest,
@@ -122,8 +125,9 @@ APP_DESCRIPTION = """
 5. `GET /api/v1/market/depth?ticker=BTCUSDT` — посмотрите лучшие уровни стакана.
 6. `POST /api/v1/orders` — выставьте `LIMIT` (лимит по коридору) или `MARKET`
    (исполнение по лучшей цене стакана), с `IOC` или `GTC`.
-7. `POST /api/v1/copy-trading/subscribe` — подпишите `SLAVE` на `MASTER`.
-8. `GET /api/v1/copy-trading/history` — проверьте `EXECUTED` / `SKIPPED` и причину.
+7. `GET /api/v1/portfolio/exposure` — знаковая экспозиция по открытым позициям.
+8. `POST /api/v1/copy-trading/subscribe` — подпишите `SLAVE` на `MASTER`.
+9. `GET /api/v1/copy-trading/history` — проверьте `EXECUTED` / `SKIPPED` и причину.
 
 ## Стакан и исполнение
 
@@ -144,7 +148,8 @@ APP_DESCRIPTION = """
 
 * `/ws/market` — публичные тики. Клиент шлёт
   `{"action": "subscribe", "tickers": ["BTCUSDT"]}` (или `unsubscribe` / `set`).
-* `/ws/user?token=<JWT>` — приватные события `order_status`, `position_closed`,
+* `/ws/user?token=<JWT>` — приватные события `exposure_snapshot` (сразу после
+  подключения), `exposure_updated`, `order_status`, `position_closed`,
   `copy_trade_result`, `balance_updated`. Невалидный JWT → закрытие с кодом `4401`.
 
 ## Деньги
@@ -432,6 +437,22 @@ async def deposit(
 )
 async def portfolio_summary(user: CurrentUser, engine: EngineDep) -> PortfolioSummary:
     return await engine.get_summary(user["user_id"])
+
+
+@app.get(
+    "/api/v1/portfolio/exposure",
+    response_model=AccountExposure,
+    tags=["portfolio"],
+    summary="Знаковая экспозиция счета по открытым позициям",
+    description=(
+        "`total_exposure = sum(quantity * mark_price)` по открытым long-позициям. "
+        "`mark_price` — текущий bid; комиссии и замороженные средства не учитываются. "
+        "Совпадает с первым сообщением `exposure_snapshot` в `/ws/user`."
+    ),
+    responses=errors(401, 404),
+)
+async def portfolio_exposure(user: CurrentUser, engine: EngineDep) -> AccountExposure:
+    return await engine.get_exposure(user["user_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -732,24 +753,41 @@ async def ws_user(
 
     await websocket.accept()
     manager: ConnectionManager = websocket.app.state.ws
-    connection = manager.attach_user(user_id, websocket)
-    connection.enqueue(
-        {
-            "event": "connected",
-            "user_id": user_id,
-            "detail": "Private stream established",
-        }
-    )
+    engine: TradingEngine = websocket.app.state.engine
+    connection = None
+
+    def register(snapshot: ExposureSnapshotEvent) -> None:
+        nonlocal connection
+        # The writer starts only after the snapshot is queued, so every later
+        # exposure update is guaranteed to arrive after it.
+        connection = manager.attach_user(user_id, websocket, start=False)
+        connection.enqueue(snapshot.model_dump(mode="json"))
+        connection.start()
+        connection.enqueue(
+            {
+                "event": "connected",
+                "user_id": user_id,
+                "detail": "Private stream established",
+            }
+        )
+
+    try:
+        await engine.attach_exposure_stream(user_id, register)
+    except BusinessError:
+        await websocket.close(code=4401, reason="User does not exist")
+        return
+
     try:
         while True:
             # Drain inbound frames (keepalive / pings); all real events are pushed.
             raw = await websocket.receive_text()
-            if raw.strip() == "ping":
+            if raw.strip() == "ping" and connection is not None:
                 connection.enqueue({"event": "pong"})
     except WebSocketDisconnect:
         pass
     finally:
-        manager.detach_user(user_id, connection)
+        if connection is not None:
+            manager.detach_user(user_id, connection)
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +809,8 @@ def custom_openapi() -> dict[str, Any]:
         PositionClosedEvent,
         CopyTradeResultEvent,
         BalanceUpdatedEvent,
+        ExposureSnapshotEvent,
+        ExposureUpdatedEvent,
         WSChannelMessage,
     ):
         schemas[model.__name__] = model.model_json_schema(
@@ -790,6 +830,8 @@ def custom_openapi() -> dict[str, Any]:
                 "#/components/schemas/PositionClosedEvent",
                 "#/components/schemas/CopyTradeResultEvent",
                 "#/components/schemas/BalanceUpdatedEvent",
+                "#/components/schemas/ExposureSnapshotEvent",
+                "#/components/schemas/ExposureUpdatedEvent",
             ],
         },
     }

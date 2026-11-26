@@ -275,6 +275,72 @@ class PortfolioSummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Exposure (risk view)
+# ---------------------------------------------------------------------------
+class ExposurePosition(BaseModel):
+    ticker: str
+    quantity: Money
+    mark_price: Money = Field(description="Bid price used for valuation.")
+    exposure: Money = Field(description="`quantity * mark_price`.")
+
+
+class AccountExposure(BaseModel):
+    user_id: int
+    total_exposure: Money = Field(
+        description="Sum of `quantity * mark_price` over open positions."
+    )
+    positions: list[ExposurePosition]
+
+
+class ExposureSnapshotEvent(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "event": "exposure_snapshot",
+                    "user_id": 1,
+                    "total_exposure": "0.00000000",
+                    "positions": [],
+                    "timestamp": "2026-11-19T10:00:00.000Z",
+                }
+            ]
+        }
+    )
+
+    event: Literal["exposure_snapshot"] = "exposure_snapshot"
+    user_id: int
+    total_exposure: Money
+    positions: list[ExposurePosition]
+    timestamp: UtcTimestamp
+
+
+class ExposureUpdatedEvent(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "event": "exposure_updated",
+                    "user_id": 1,
+                    "total_exposure": "6500.00000000",
+                    "delta": "6500.00000000",
+                    "last_order_id": 42,
+                    "reason": None,
+                    "timestamp": "2026-11-19T10:00:00.000Z",
+                }
+            ]
+        }
+    )
+
+    event: Literal["exposure_updated"] = "exposure_updated"
+    user_id: int
+    total_exposure: Money
+    delta: Money = Field(description="`+qty*price` for BUY, `-qty*price` for SELL.")
+    last_order_id: int | None = None
+    reason: str | None = None
+    timestamp: UtcTimestamp
+
+
+# ---------------------------------------------------------------------------
 # Market data
 # ---------------------------------------------------------------------------
 class TickerQuote(BaseModel):

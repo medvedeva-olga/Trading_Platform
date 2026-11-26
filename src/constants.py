@@ -65,3 +65,5 @@ class WsEvent(StrEnum):
     ERROR = "error"
     BALANCE_UPDATED = "balance_updated"
     COPY_TRADE_RESULT = "copy_trade_result"
+    EXPOSURE_SNAPSHOT = "exposure_snapshot"
+    EXPOSURE_UPDATED = "exposure_updated"

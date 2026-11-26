@@ -11,6 +11,7 @@ from src.constants import (
     WsEvent,
 )
 
+from .portfolio import ExposurePosition
 from .types import MoneyStr, UtcTimestampStr
 
 
@@ -67,6 +68,24 @@ class OrderStatusEvent(BaseModel):
     filled_qty: MoneyStr = Decimal("0")
     fee_amount: MoneyStr = Decimal("0")
     price_improvement: MoneyStr = Decimal("0")
+    reason: str | None = None
+    timestamp: UtcTimestampStr
+
+
+class ExposureSnapshotEvent(BaseModel):
+    event: Literal[WsEvent.EXPOSURE_SNAPSHOT] = WsEvent.EXPOSURE_SNAPSHOT
+    user_id: int
+    total_exposure: MoneyStr
+    positions: list[ExposurePosition]
+    timestamp: UtcTimestampStr
+
+
+class ExposureUpdatedEvent(BaseModel):
+    event: Literal[WsEvent.EXPOSURE_UPDATED] = WsEvent.EXPOSURE_UPDATED
+    user_id: int
+    total_exposure: MoneyStr
+    delta: MoneyStr
+    last_order_id: int | None = None
     reason: str | None = None
     timestamp: UtcTimestampStr
 

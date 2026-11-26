@@ -98,9 +98,14 @@ class ConnectionManager:
                 connection.enqueue(payload)
 
     # -- private user channels --------------------------------------------
-    def attach_user(self, user_id: int, websocket: WebSocket) -> ClientConnection:
+    def attach_user(
+        self, user_id: int, websocket: WebSocket, *, start: bool = True
+    ) -> ClientConnection:
+        """Register a private socket; ``start=False`` lets callers enqueue a
+        snapshot before the writer begins sending."""
         connection = ClientConnection(websocket)
-        connection.start()
+        if start:
+            connection.start()
         self._users.setdefault(user_id, set()).add(connection)
         return connection
 

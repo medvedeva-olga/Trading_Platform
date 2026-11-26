@@ -7,7 +7,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import bcrypt
 from sqlalchemy import func, select
@@ -27,6 +27,7 @@ from .models import (
     User,
 )
 from .schemas import (
+    AccountExposure,
     BalanceUpdatedEvent,
     BusinessError,
     CopyHistoryItem,
@@ -34,6 +35,9 @@ from .schemas import (
     CopySubscriptionUpdate,
     CopyTradeResultEvent,
     DepositResponse,
+    ExposurePosition,
+    ExposureSnapshotEvent,
+    ExposureUpdatedEvent,
     MasterStats,
     OrderCreateRequest,
     OrderResponse,
@@ -130,6 +134,52 @@ class TradingEngine:
             filled_qty=money(order.filled_qty),
             fee_amount=money(order.fee_amount),
             price_improvement=money(order.price_improvement),
+            reason=reason,
+            timestamp=now(),
+        )
+
+    async def _account_exposure_locked(
+        self, session: AsyncSession, user_id: int
+    ) -> AccountExposure:
+        """Risk view from open long positions, valued at the current bid."""
+        positions = await session.scalars(
+            select(Position).where(
+                Position.user_id == user_id, Position.quantity > ZERO
+            )
+        )
+        items: list[ExposurePosition] = []
+        total = ZERO
+        for position in positions:
+            mark_price = money(self.feed.get_quote(position.ticker).bid)
+            exposure = money(position.quantity * mark_price)
+            items.append(
+                ExposurePosition(
+                    ticker=position.ticker,
+                    quantity=money(position.quantity),
+                    mark_price=mark_price,
+                    exposure=exposure,
+                )
+            )
+            total = money(total + exposure)
+        return AccountExposure(user_id=user_id, total_exposure=total, positions=items)
+
+    async def _exposure_event_locked(
+        self,
+        session: AsyncSession,
+        user_id: int,
+        delta: Decimal,
+        *,
+        order_id: int | None = None,
+        reason: str | None = None,
+    ) -> ExposureUpdatedEvent:
+        # The position was mutated in Python; flush so the exposure query sees it.
+        await session.flush()
+        exposure = await self._account_exposure_locked(session, user_id)
+        return ExposureUpdatedEvent(
+            user_id=user_id,
+            total_exposure=exposure.total_exposure,
+            delta=money(delta),
+            last_order_id=order_id,
             reason=reason,
             timestamp=now(),
         )
@@ -280,6 +330,35 @@ class TradingEngine:
                 unrealized_pnl=total_unrealized,
                 realized_pnl=money(portfolio.realized_pnl),
                 equity=money(total_balance + total_market_value),
+            )
+
+    async def get_exposure(self, user_id: int) -> AccountExposure:
+        async with self._lock, SessionLocal() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                raise BusinessError("USER_NOT_FOUND", "User does not exist.", 404)
+            return await self._account_exposure_locked(session, user_id)
+
+    async def attach_exposure_stream(
+        self, user_id: int, register: Callable[[ExposureSnapshotEvent], None]
+    ) -> None:
+        """Build the initial snapshot and register the socket under one lock.
+
+        Callbacks that publish order events use the same lock, so no fill can
+        slip between the snapshot read and the socket registration.
+        """
+        async with self._lock, SessionLocal() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                raise BusinessError("USER_NOT_FOUND", "User does not exist.", 404)
+            exposure = await self._account_exposure_locked(session, user_id)
+            register(
+                ExposureSnapshotEvent(
+                    user_id=user_id,
+                    total_exposure=exposure.total_exposure,
+                    positions=exposure.positions,
+                    timestamp=now(),
+                )
             )
 
     # ------------------------------------------------------------------
@@ -468,6 +547,15 @@ class TradingEngine:
             order.status = "PARTIALLY_FILLED"
         events.append(self._order_event(order, order.status, price, order.reason))
         events.append(self._balance_event(portfolio, order.user_id, "ORDER_FILLED"))
+        signed_delta = quantity if order.side == "BUY" else -quantity
+        events.append(
+            await self._exposure_event_locked(
+                session,
+                order.user_id,
+                money(signed_delta * price),
+                order_id=order.id,
+            )
+        )
         return events
 
     async def create_order(
@@ -661,7 +749,8 @@ class TradingEngine:
 
             await session.commit()
             for event in events:
-                self._publish_to_user(user_id, event)
+                # Maker fills can belong to another user, so route by event owner.
+                self._publish_to_user(getattr(event, "user_id", user_id), event)
 
             snapshot: dict[str, Any] | None = None
             if order.status == "FILLED" and user.role == "MASTER" and not order.is_copy:
@@ -796,6 +885,13 @@ class TradingEngine:
                 timestamp=now(),
             ),
             self._balance_event(portfolio, position.user_id, "POSITION_CLOSED"),
+            await self._exposure_event_locked(
+                session,
+                position.user_id,
+                -proceeds,
+                order_id=order_id,
+                reason=reason,
+            ),
         ]
 
     async def handle_tick(self, ticker: str, quote: Quote) -> None:

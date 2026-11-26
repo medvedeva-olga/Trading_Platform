@@ -10,6 +10,8 @@ API- и WebSocket-автотестов на **pytest + httpx + websockets**.
 * регистрация, логин, депозит и транзакции — реальная бизнес-логика;
 * ордера исполняются через стакан: `LIMIT` / `MARKET`, `IOC` / `GTC`, частичные
   исполнения, комиссия тейкера и price improvement;
+* экспозиция счета доступна через REST и первое WebSocket-сообщение, а каждое
+  исполнение присылает дельту экспозиции;
 * **нет** искусственных ручек сброса БД / «_set price_» — изоляция тестов достигается
   уникальными пользователями и пополнением баланса. Исключение: QA-оверрайд стакана
   при `TRADING_QA_MODE=true` (см. ниже).
@@ -103,10 +105,12 @@ poetry run flake8 app/ src/ tests/
 
 ### Статус покрытия и планы
 
-Устойчиво покрыты домены `auth`, `copy_trading`, `websocket` и `orders`.
-Order-тесты проверяют полный цикл `IOC` / `GTC`, отмену с разморозкой,
-`stop_loss` / `take_profit`, стакан, `MARKET` / `LIMIT`, частичное исполнение,
-комиссии и price improvement. Всего в наборе 44 теста, прогон зелёный.
+Устойчиво покрыты домены `auth`, `copy_trading`, `websocket`, `orders` и
+`portfolio` (экспозиция). Order-тесты проверяют полный цикл `IOC` / `GTC`,
+отмену с разморозкой, `stop_loss` / `take_profit`, стакан, `MARKET` / `LIMIT`,
+частичное исполнение, комиссии и price improvement. Экспозиционные тесты
+проверяют REST/WS-снимок и дельты при покупке и продаже. Всего в наборе 48
+тестов, прогон зелёный.
 Тесты используют общего клиента, фабрики данных и доменные `StrEnum`-константы
 из `src/constants.py`.
 
@@ -241,6 +245,7 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
 | `POST` | `/api/v1/auth/login` | Выдача JWT |
 | `POST` | `/api/v1/portfolio/deposit` | Пополнение баланса (запись в транзакции) |
 | `GET` | `/api/v1/portfolio/summary` | Баланс, позиции, market value, PnL |
+| `GET` | `/api/v1/portfolio/exposure` | Знаковая экспозиция по открытым позициям |
 | `GET` | `/api/v1/market/tickers` | Bid / Ask / Last / Spread |
 | `GET` | `/api/v1/market/depth` | Стакан: `bids` / `asks` с объёмами |
 | `POST` | `/api/v1/orders` | Ордер (`LIMIT` / `MARKET`, `IOC` / `GTC`) |
@@ -270,6 +275,17 @@ QA-ручки стакана (`POST` / `DELETE /api/v1/test/depth`) доступ
   в таблицу `trades`.
 * Copy-trading запускается только при `FILLED` ордера Мастера;
   `PARTIALLY_FILLED` копирование не запускает.
+
+### Экспозиция
+
+`GET /api/v1/portfolio/exposure` возвращает `total_exposure = sum(quantity × mark_price)`
+по открытым long-позициям; `mark_price` — текущий bid. Комиссии и замороженные
+средства в экспозицию не входят. Это рисковая метрика, а не остаток денег:
+увеличение экспозиции при `BUY` и уменьшение при `SELL` приходят в `/ws/user`
+событием `exposure_updated` (`delta = ±quantity × price`, `last_order_id`).
+Первое сообщение после подключения — `exposure_snapshot`, идентичное REST-ответу
+на момент подключения. Значения — Decimal-строки; шорты SUT не поддерживает,
+поэтому экспозиция не бывает отрицательной.
 
 ### Формат ошибок
 
@@ -316,6 +332,9 @@ QA-ручки стакана (`POST` / `DELETE /api/v1/test/depth`) доступ
 
 События:
 
+* `exposure_snapshot` — первое сообщение после подключения, совпадает с REST
+  `/api/v1/portfolio/exposure` на момент подключения;
+* `exposure_updated` — дельта экспозиции после исполнения (`delta`, `last_order_id`);
 * `order_status` — `NEW` / `PARTIALLY_FILLED` / `FILLED` / `CANCELED`, плюс
   `filled_qty`, `fee_amount`, `price_improvement` и `reason`;
 * `position_closed` — с итоговым `pnl` и `reason` (`MANUAL` / `STOP_LOSS` / `TAKE_PROFIT`);
@@ -375,7 +394,7 @@ src/               # общая QA-инфраструктура
   fixtures/        # фабрики данных и поллинг без time.sleep()
   schemas/         # Pydantic-контракты (auth, copy-trading, websocket, order, market)
 tests/             # тесты по доменам
-  auth/  copy_trading/  orders/  websocket/
+  auth/  copy_trading/  orders/  portfolio/  websocket/
   conftest.py      # Lifecycle SUT, изолированные пользователи, QA mode
   config.py        # настройки тестов с префиксом QA_
 ```
