@@ -8,17 +8,16 @@ from src.clients.validators import (
     expect_model,
     expect_model_list,
     expect_status,
+    expect_validation_error,
 )
+from src.constants import OrderSide, OrderStatus, Ticker, TimeInForce
 from src.fixtures import corridor, order_payload
-from src.clients.validators import expect_validation_error
+from src.messages import OrderError
 from src.schemas.market_data import TickerQuote
 from src.schemas.order import OrderResponse
 from src.schemas.portfolio import PortfolioSummary
 from src.schemas.types import MONEY_QUANTUM
-from src.constants import OrderSide, Ticker, OrderStatus, TimeInForce
-from src.messages import OrderError
 from tests.config import settings as qa
-
 
 UNREACHABLE = "0.00000010"
 
@@ -43,14 +42,14 @@ async def test_create_ioc_order_inside_corridor_returns_filled(master):
             amount=qa.btc_amount,
             min_price=low,
             max_price=high,
-            time_in_force= TimeInForce.IOC
+            time_in_force=TimeInForce.IOC,
         )
     )
 
     order = expect_model(response, OrderResponse, expected=HTTPStatus.CREATED)
     assert order.status == OrderStatus.FILLED
     assert order.filled_at is not None
-    assert order.filled_price is not None         
+    assert order.filled_price is not None
     assert Decimal(low) <= order.filled_price <= Decimal(high)
     assert order.is_copy is False
 
@@ -62,7 +61,7 @@ async def test_create_ioc_order_outside_corridor_returns_canceled(master):
         amount=qa.btc_amount,
         min_price=UNREACHABLE,
         max_price=UNREACHABLE,
-        time_in_force= TimeInForce.IOC
+        time_in_force=TimeInForce.IOC,
     )
 
     response = await master.client.create_order(payload)
@@ -80,18 +79,22 @@ async def test_create_gtc_order_outside_corridor_reserves_funds(master):
         amount=qa.eth_amount,
         min_price=UNREACHABLE,
         max_price=UNREACHABLE,
-        time_in_force= TimeInForce.GTC,
+        time_in_force=TimeInForce.GTC,
     )
 
     response = await master.client.create_order(payload)
 
     order = expect_model(response, OrderResponse, expected=HTTPStatus.CREATED)
-    assert order.status == OrderStatus.PENDING
+    assert order.status == OrderStatus.NEW
     assert order.reason == "AWAITING_RANGE"
-    #зарезервировано amount* max_price
-    assert order.reserved_amount == Decimal(qa.eth_amount) * Decimal(UNREACHABLE).quantize(MONEY_QUANTUM)
+    # зарезервировано amount* max_price
+    assert order.reserved_amount == Decimal(qa.eth_amount) * Decimal(
+        UNREACHABLE
+    ).quantize(MONEY_QUANTUM)
     summary = expect_model(
-        await master.client.portfolio_summary(), PortfolioSummary, expected=HTTPStatus.OK
+        await master.client.portfolio_summary(),
+        PortfolioSummary,
+        expected=HTTPStatus.OK,
     )
     assert summary.frozen_balance == order.reserved_amount
 
@@ -110,8 +113,9 @@ async def test_create_order_with_reversed_corridor_returns_422(master):
 
     response = await master.client.create_order(payload)
 
-    expect_validation_error(response, OrderError.MIN_PRICE_GR_MAX, HTTPStatus.UNPROCESSABLE_ENTITY)
-
+    expect_validation_error(
+        response, OrderError.MIN_PRICE_GR_MAX, HTTPStatus.UNPROCESSABLE_ENTITY
+    )
 
 
 async def test_create_order_with_unknown_ticker_returns_422(master):
@@ -146,7 +150,9 @@ async def test_create_buy_order_without_funds_returns_400(user_factory):
         )
     )
 
-    detail = expect_custom_error(response, "INSUFFICIENT_FUNDS", status=HTTPStatus.BAD_REQUEST)
+    detail = expect_custom_error(
+        response, "INSUFFICIENT_FUNDS", status=HTTPStatus.BAD_REQUEST
+    )
     assert Decimal(detail["details"]["required"]) > Decimal(
         detail["details"]["available"]
     )
@@ -175,4 +181,6 @@ async def test_sell_more_than_open_position_returns_400(master):
         )
     )
 
-    expect_custom_error(response, "INSUFFICIENT_POSITION", status=HTTPStatus.BAD_REQUEST)
+    expect_custom_error(
+        response, "INSUFFICIENT_POSITION", status=HTTPStatus.BAD_REQUEST
+    )

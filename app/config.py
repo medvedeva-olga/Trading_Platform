@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     )
     spread_bps: int = 10  # 1 bp = 0.01%
 
+    # Matching engine settings. The synthetic book is deterministic background
+    # liquidity; QA can override it through the guarded test endpoint.
+    fee_rate: Decimal = Decimal("0.00100000")  # 0.1% charged to the taker
+    synthetic_depth_qty: Decimal = Decimal("1000.00000000")
+    depth_levels: int = 5
+    qa_mode: bool = False
+
     min_deposit: Decimal = Decimal("100.00000000")
     max_deposit: Decimal = Decimal("1000000.00000000")
     min_order_amount: Decimal = Decimal("0.00000001")

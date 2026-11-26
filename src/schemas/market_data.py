@@ -27,3 +27,10 @@ class TickerQuote(BaseModel):
             ]
         }
     )
+
+
+class DepthResponse(BaseModel):
+    ticker: Ticker
+    bids: list[tuple[MoneyStr, MoneyStr]]
+    asks: list[tuple[MoneyStr, MoneyStr]]
+    timestamp: UtcTimestampStr

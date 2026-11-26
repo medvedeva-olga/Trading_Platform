@@ -2,6 +2,7 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
+from src.constants import OrderType, TimeInForce
 from src.schemas.types import MONEY_QUANTUM
 
 LOW_FACTOR = Decimal("0.8")
@@ -33,13 +34,15 @@ def order_payload(
     amount: str,
     min_price: str,
     max_price: str,
-    time_in_force: str = "IOC",
+    time_in_force: str = TimeInForce.IOC,
+    order_type: str = OrderType.LIMIT,
     stop_loss: str | None = None,
     take_profit: str | None = None,
 ) -> dict[str, Any]:
     return {
         "ticker": ticker,
         "side": side,
+        "order_type": order_type,
         "amount": amount,
         "min_price": min_price,
         "max_price": max_price,

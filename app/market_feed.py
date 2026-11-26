@@ -27,6 +27,9 @@ class Quote:
     timestamp: datetime
 
 
+DepthSide = tuple[tuple[Decimal, Decimal], ...]
+
+
 class MarketFeed:
     """Emits a quote for every configured ticker every ``tick_interval_ms``."""
 
@@ -39,6 +42,7 @@ class MarketFeed:
         self._lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._rng = random.Random(settings.market_seed)
+        self._depth_overrides: dict[str, tuple[DepthSide, DepthSide]] = {}
         self._refresh_quotes()
 
     def subscribe(self, callback: TickCallback) -> None:
@@ -70,6 +74,48 @@ class MarketFeed:
 
     def get_quotes(self) -> dict[str, Quote]:
         return dict(self._quotes)
+
+    def get_depth(self, ticker: str) -> tuple[DepthSide, DepthSide]:
+        """Return synthetic (or QA-overridden) book levels for ``ticker``."""
+        if ticker not in self._quotes:
+            raise KeyError(f"Unknown ticker: {ticker}")
+        override = self._depth_overrides.get(ticker)
+        if override is not None:
+            return override
+        quote = self._quotes[ticker]
+        return self._synthetic_depth(quote)
+
+    def set_depth(
+        self,
+        ticker: str,
+        bids: list[tuple[Decimal, Decimal]],
+        asks: list[tuple[Decimal, Decimal]],
+    ) -> None:
+        if ticker not in self._quotes:
+            raise KeyError(f"Unknown ticker: {ticker}")
+        self._depth_overrides[ticker] = (tuple(bids), tuple(asks))
+
+    def reset_depth(self, ticker: str | None = None) -> None:
+        if ticker is None:
+            self._depth_overrides.clear()
+        else:
+            self._depth_overrides.pop(ticker, None)
+
+    @staticmethod
+    def _synthetic_depth(quote: Quote) -> tuple[DepthSide, DepthSide]:
+        # Keep synthetic levels inside a 1 bp band so a corridor starting just
+        # above/below the current quote stays resting until the market moves.
+        step = max(money(quote.last * Decimal("0.00001")), Decimal("0.00000001"))
+        quantity = money(settings.synthetic_depth_qty)
+        bids = tuple(
+            (money(quote.bid - i * step), quantity)
+            for i in range(settings.depth_levels)
+        )
+        asks = tuple(
+            (money(quote.ask + i * step), quantity)
+            for i in range(settings.depth_levels)
+        )
+        return bids, asks
 
     def _refresh_quotes(self) -> None:
         for ticker, last in self._prices.items():

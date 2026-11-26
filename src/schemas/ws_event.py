@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -63,6 +64,9 @@ class OrderStatusEvent(BaseModel):
     side: str
     status: OrderStatus
     price: MoneyStr | None = None
+    filled_qty: MoneyStr = Decimal("0")
+    fee_amount: MoneyStr = Decimal("0")
+    price_improvement: MoneyStr = Decimal("0")
     reason: str | None = None
     timestamp: UtcTimestampStr
 

@@ -60,6 +60,20 @@ class TradingAPIClient:
     async def tickers(self) -> httpx.Response:
         return await self._http.get("/api/v1/market/tickers", headers=self.headers)
 
+    async def depth(self, ticker: str, limit: int = 5) -> httpx.Response:
+        return await self._http.get(
+            "/api/v1/market/depth",
+            headers=self.headers,
+            params={"ticker": ticker, "limit": limit},
+        )
+
+    async def set_depth(self, payload: dict[str, Any]) -> httpx.Response:
+        return await self._http.post("/api/v1/test/depth", json=payload)
+
+    async def reset_depth(self, ticker: str | None = None) -> httpx.Response:
+        params = {"ticker": ticker} if ticker else None
+        return await self._http.delete("/api/v1/test/depth", params=params)
+
     async def create_order(self, payload: dict[str, Any]) -> httpx.Response:
         return await self._http.post(
             "/api/v1/orders", headers=self.headers, json=payload

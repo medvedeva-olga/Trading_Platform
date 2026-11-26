@@ -14,9 +14,11 @@ class Ticker(StrEnum):
 
 
 class OrderStatus(StrEnum):
-    PENDING = "PENDING"
+    NEW = "NEW"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"
     CANCELED = "CANCELED"
+    PENDING = "PENDING"  # deprecated alias of the pre-book API
 
 
 class CopyTradingStatus(StrEnum):
@@ -42,7 +44,13 @@ class OrderSide(StrEnum):
 
 class TimeInForce(StrEnum):
     IOC = "IOC"
-    GTC ="GTC"
+    GTC = "GTC"
+
+
+class OrderType(StrEnum):
+    LIMIT = "LIMIT"
+    MARKET = "MARKET"
+
 
 class SkipReason(StrEnum):
     SLIPPAGE_EXCEEDED = "SLIPPAGE_EXCEEDED"

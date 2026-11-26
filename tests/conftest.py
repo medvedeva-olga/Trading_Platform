@@ -26,6 +26,7 @@ os.environ["TRADING_JWT_ALGORITHM"] = qa.jwt_algorithm
 os.environ["TRADING_COPY_DELAY_MS"] = str(qa.copy_delay_ms)
 os.environ["TRADING_MARKET_TICK_INTERVAL_MS"] = str(qa.tick_interval_ms)
 os.environ["TRADING_MARKET_REGIME"] = qa.market_regime
+os.environ["TRADING_QA_MODE"] = "true"
 
 
 @dataclass(frozen=True)

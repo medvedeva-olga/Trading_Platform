@@ -48,8 +48,10 @@ UtcTimestamp = Annotated[
 Role = Literal["MASTER", "SLAVE"]
 Side = Literal["BUY", "SELL"]
 TimeInForce = Literal["IOC", "GTC"]
+OrderType = Literal["LIMIT", "MARKET"]
 Ticker = Literal["BTCUSDT", "ETHUSDT", "SOLUSDT", "TONUSDT"]
-OrderStatus = Literal["PENDING", "FILLED", "CANCELED"]
+# PENDING is kept as a deprecated alias for clients of the pre-book API.
+OrderStatus = Literal["NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED", "PENDING"]
 CopyMode = Literal["PROPORTIONAL", "FIXED_RATIO"]
 
 
@@ -299,6 +301,21 @@ class TickerQuote(BaseModel):
     )
 
 
+class DepthResponse(BaseModel):
+    ticker: Ticker
+    bids: list[tuple[Money, Money]]
+    asks: list[tuple[Money, Money]]
+    timestamp: UtcTimestamp
+
+
+class DepthOverride(BaseModel):
+    """QA-only replacement for the deterministic synthetic book."""
+
+    ticker: Ticker
+    bids: list[tuple[Money, Money]]
+    asks: list[tuple[Money, Money]]
+
+
 # ---------------------------------------------------------------------------
 # Orders
 # ---------------------------------------------------------------------------
@@ -333,6 +350,10 @@ class OrderCreateRequest(BaseModel):
     ticker: Ticker = Field(description="One of BTCUSDT, ETHUSDT, SOLUSDT, TONUSDT.")
     side: Side = Field(
         description="`BUY` opens/increases a long position, `SELL` reduces/closes it."
+    )
+    order_type: OrderType = Field(
+        default="LIMIT",
+        description="`LIMIT` respects the corridor; `MARKET` matches any available price.",
     )
     amount: Money = Field(
         gt=0, examples=["0.10000000"], description="Amount in base asset."
@@ -372,7 +393,10 @@ class OrderResponse(ORMModel):
     user_id: int
     ticker: str
     side: str
+    order_type: str
     amount: Money
+    filled_qty: Money
+    remaining_qty: Money
     min_price: Money
     max_price: Money
     time_in_force: str
@@ -381,6 +405,8 @@ class OrderResponse(ORMModel):
     status: str
     filled_price: Money | None
     reserved_amount: Money
+    fee_amount: Money
+    price_improvement: Money
     reason: str | None
     is_copy: bool
     copy_of_order_id: int | None
@@ -617,6 +643,9 @@ class OrderStatusEvent(BaseModel):
     side: str
     status: OrderStatus
     price: Money | None = None
+    filled_qty: Money = Decimal("0")
+    fee_amount: Money = Decimal("0")
+    price_improvement: Money = Decimal("0")
     reason: str | None = None
     timestamp: UtcTimestamp
 

@@ -8,8 +8,11 @@ API- и WebSocket-автотестов на **pytest + httpx + websockets**.
 * состояние хранится в файле **`trading.db`** (SQLite) и сохраняется между перезапусками;
 * все деньги — `Decimal` с точностью 8 знаков и сериализуются строками (`"65000.00000000"`);
 * регистрация, логин, депозит и транзакции — реальная бизнес-логика;
+* ордера исполняются через стакан: `LIMIT` / `MARKET`, `IOC` / `GTC`, частичные
+  исполнения, комиссия тейкера и price improvement;
 * **нет** искусственных ручек сброса БД / «_set price_» — изоляция тестов достигается
-  уникальными пользователями и пополнением баланса.
+  уникальными пользователями и пополнением баланса. Исключение: QA-оверрайд стакана
+  при `TRADING_QA_MODE=true` (см. ниже).
 
 ---
 
@@ -24,6 +27,7 @@ API- и WebSocket-автотестов на **pytest + httpx + websockets**.
 | Авторизация | JWT (HS256, PyJWT) + bcrypt |
 | Потоки | WebSocket (`/ws/market`, `/ws/user`) |
 | Деньги | `decimal.Decimal`, `NUMERIC(20, 8)` |
+| Исполнение | стакан, best price/time priority, частичные fills, `trades` |
 
 ---
 
@@ -79,6 +83,7 @@ poetry run pytest -m smoke -v
 
 # Конкретный домен / файл
 poetry run pytest tests/copy_trading/test_copy_trading.py -v
+poetry run pytest tests/orders/test_order_book.py -v
 
 # Линтеры и форматирование (включая код приложения)
 poetry run black --check app/ src/ tests/
@@ -93,14 +98,17 @@ poetry run flake8 app/ src/ tests/
 
 Настройки самих тестов (порт, таймауты, депозиты) читаются с префиксом `QA_`
 из `tests/config.py`; переменные окружения SUT выставляет `tests/conftest.py`
-до импорта приложения. Маркеры: `smoke`, `copy`, `websocket`.
+до импорта приложения (включая `TRADING_QA_MODE=true`). Маркеры: `smoke`,
+`copy`, `websocket`.
 
 ### Статус покрытия и планы
 
-Набор автотестов **ещё в процессе написания**. На данный момент устойчиво
-покрыты три домена — `auth`, `copy_trading`, `websocket`. Тесты используют
-общего клиента, фабрики данных и доменные `StrEnum`-константы из
-`src/constants.py`.
+Устойчиво покрыты домены `auth`, `copy_trading`, `websocket` и `orders`.
+Order-тесты проверяют полный цикл `IOC` / `GTC`, отмену с разморозкой,
+`stop_loss` / `take_profit`, стакан, `MARKET` / `LIMIT`, частичное исполнение,
+комиссии и price improvement. Всего в наборе 44 теста, прогон зелёный.
+Тесты используют общего клиента, фабрики данных и доменные `StrEnum`-константы
+из `src/constants.py`.
 
 Планируемое расширение текущих доменов:
 
@@ -111,15 +119,15 @@ poetry run flake8 app/ src/ tests/
   повторные подписки и отписки, больше сценариев `SKIPPED`;
 * **websocket** — явные тесты действий `unsubscribe` и `set`, негативные кадры
   подписки, переподключения и коды закрытия, порядок событий;
+* **orders** — матчинг двух пользовательских ордеров (maker/maker), сценарии
+  `SELL` против стакана, auditing таблицы `trades`, отмена `PARTIALLY_FILLED`
+  с частичной разморозкой;
 * **контракты** — сверка QA-зеркал из `src/schemas/` с OpenAPI приложения,
   чтобы вовремя находить расхождение схем.
 
 Отдельно планируется добавить в тестовый проект другие домены SUT, которые
 сейчас не покрыты:
 
-* **orders** — жизненный цикл `IOC` / `GTC`, отмена с разморозкой средств,
-  срабатывание `stop_loss` / `take_profit`, ошибки `INSUFFICIENT_FUNDS`,
-  `INVALID_TICKER`, `ORDER_NOT_FOUND`;
 * **portfolio** — лимиты депозита, история транзакций, расчёт equity / PnL и
   замороженного баланса;
 * **market** — схема котировок, соотношение `bid <= last <= ask`, спред,
@@ -144,6 +152,10 @@ poetry run flake8 app/ src/ tests/
 | `TRADING_MARKET_SEED` | — | Seed генератора случайных чисел |
 | `TRADING_SPREAD_BPS` | `10` | Спред в базисных пунктах (1 bp = 0.01%) |
 | `TRADING_COPY_DELAY_MS` | `250` | Задержка копирования сделки Мастера |
+| `TRADING_FEE_RATE` | `0.001` | Комиссия тейкера (0.1%) |
+| `TRADING_SYNTHETIC_DEPTH_QTY` | `1000` | Объём каждого синтетического уровня |
+| `TRADING_DEPTH_LEVELS` | `5` | Число уровней с каждой стороны |
+| `TRADING_QA_MODE` | `false` | Включить скрытые QA-ручки стакана |
 | `TRADING_MIN_DEPOSIT` / `TRADING_MAX_DEPOSIT` | `100` / `1000000` | Лимиты депозита |
 | `TRADING_HOST` / `TRADING_PORT` | `0.0.0.0` / `8000` | Для `python -m app.main` |
 
@@ -156,6 +168,25 @@ poetry run flake8 app/ src/ tests/
 ```bash
 TRADING_COPY_DELAY_MS=1500 TRADING_MARKET_REGIME=high uvicorn app.main:app --reload
 ```
+
+### Детерминированный стакан в тестах
+
+`tests/conftest.py` выставляет `TRADING_QA_MODE=true`, поэтому в прогоне доступны
+две скрытые ручки (в OpenAPI они не показываются):
+
+```bash
+# задать стакан: [[цена, объём], ...]
+curl -s -X POST http://127.0.0.1:8000/api/v1/test/depth \
+  -H 'Content-Type: application/json' \
+  -d '{"ticker":"BTCUSDT","bids":[],"asks":[["65000.00000000","0.05000000"]]}'
+
+# вернуть синтетический стакан (все тикеры или ?ticker=BTCUSDT)
+curl -s -X DELETE http://127.0.0.1:8000/api/v1/test/depth
+```
+
+Без `TRADING_QA_MODE=true` эти ручки отвечают `404`. Оверрайд живёт в памяти
+процесса и сбрасывается autouse-фикстурой в `tests/orders/test_order_book.py`,
+поэтому не влияет на другие сценарии.
 
 ---
 
@@ -178,14 +209,16 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/portfolio/deposit \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"amount":"10000.00000000"}'
 
-# 2. Текущие котировки (построить коридор от bid/ask)
+# 2. Текущие котировки и стакан
 curl -s http://127.0.0.1:8000/api/v1/market/tickers -H "Authorization: Bearer $TOKEN"
+curl -s 'http://127.0.0.1:8000/api/v1/market/depth?ticker=BTCUSDT&limit=5' \
+  -H "Authorization: Bearer $TOKEN"
 
 # 3. IOC-ордер в коридоре текущей цены
 curl -s -X POST http://127.0.0.1:8000/api/v1/orders \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{
-    "ticker":"BTCUSDT","side":"BUY","amount":"0.10000000",
+    "ticker":"BTCUSDT","side":"BUY","order_type":"LIMIT","amount":"0.10000000",
     "min_price":"60000.00000000","max_price":"70000.00000000",
     "time_in_force":"IOC","stop_loss":null,"take_profit":null
   }'
@@ -195,6 +228,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
   -H 'Content-Type: application/json' \
   -d '{"username":"qa_slave_001","password":"StrongPass123!","role":"SLAVE"}'
 ```
+
+`order_type` — `LIMIT` (по умолчанию) или `MARKET`.
 
 ---
 
@@ -207,15 +242,34 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
 | `POST` | `/api/v1/portfolio/deposit` | Пополнение баланса (запись в транзакции) |
 | `GET` | `/api/v1/portfolio/summary` | Баланс, позиции, market value, PnL |
 | `GET` | `/api/v1/market/tickers` | Bid / Ask / Last / Spread |
-| `POST` | `/api/v1/orders` | Создание ордера (`IOC` / `GTC`) |
+| `GET` | `/api/v1/market/depth` | Стакан: `bids` / `asks` с объёмами |
+| `POST` | `/api/v1/orders` | Ордер (`LIMIT` / `MARKET`, `IOC` / `GTC`) |
 | `GET` | `/api/v1/orders` | История ордеров пользователя |
 | `GET` | `/api/v1/orders/{id}` | Ордер по ID |
-| `DELETE` | `/api/v1/orders/{id}` | Отмена GTC + разморозка средств |
+| `DELETE` | `/api/v1/orders/{id}` | Отмена `NEW` / `PARTIALLY_FILLED` + разморозка |
 | `GET` | `/api/v1/copy-trading/masters` | Мастера и статистика |
 | `POST` | `/api/v1/copy-trading/subscribe` | Подписка Slave на Master |
 | `GET` | `/api/v1/copy-trading/subscriptions` | Подписки Slave |
+| `PATCH` | `/api/v1/copy-trading/subscriptions/{id}` | Изменение параметров подписки |
 | `DELETE` | `/api/v1/copy-trading/subscriptions/{id}` | Отписка |
 | `GET` | `/api/v1/copy-trading/history` | Лог копирования |
+
+QA-ручки стакана (`POST` / `DELETE /api/v1/test/depth`) доступны только при
+`TRADING_QA_MODE=true` и исключены из OpenAPI.
+
+### Стакан и исполнение ордеров
+
+* Источник ликвидности — синтетический стакан вокруг текущей котировки и активные
+  ордера других пользователей. Приоритет: лучшая цена, затем время.
+* Статусы: `NEW` (resting до исполнения), `PARTIALLY_FILLED`, `FILLED`, `CANCELED`.
+  `PENDING` сохранён как устаревший псевдоним в схемах.
+* `IOC` без полного исполнения → `CANCELED` с `reason=IOC_PARTIALLY_FILLED` или
+  `IOC_OUT_OF_RANGE`; остаток `GTC` остаётся в стакане с заморозкой средств.
+* Комиссия `fee_rate` (0.1%) списывается с тейкера; исполнение по цене мейкера,
+  лучшей чем лимит, отражается в `price_improvement`. Каждое совпадение пишется
+  в таблицу `trades`.
+* Copy-trading запускается только при `FILLED` ордера Мастера;
+  `PARTIALLY_FILLED` копирование не запускает.
 
 ### Формат ошибок
 
@@ -234,8 +288,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
 Коды: `USERNAME_ALREADY_EXISTS`, `INVALID_DEPOSIT_AMOUNT`, `INSUFFICIENT_FUNDS`,
 `INSUFFICIENT_POSITION`, `INVALID_TICKER`, `AMOUNT_TOO_SMALL`, `ORDER_NOT_FOUND`,
 `ORDER_NOT_CANCELABLE`, `MASTER_NOT_FOUND`, `NOT_A_MASTER`, `ROLE_NOT_ALLOWED`,
-`CANNOT_COPY_SELF`, `FORBIDDEN`. Auth/валидация — стандартные `401` / `422`
-с полем `detail`.
+`CANNOT_COPY_SELF`, `SUBSCRIPTION_ALREADY_EXISTS`, `MASTER_ID_IMMUTABLE`,
+`FORBIDDEN`. Auth/валидация — стандартные `401` / `422` с полем `detail`.
 
 ---
 
@@ -262,7 +316,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/auth/register \
 
 События:
 
-* `order_status` — `PENDING` / `FILLED` / `CANCELED`;
+* `order_status` — `NEW` / `PARTIALLY_FILLED` / `FILLED` / `CANCELED`, плюс
+  `filled_qty`, `fee_amount`, `price_improvement` и `reason`;
 * `position_closed` — с итоговым `pnl` и `reason` (`MANUAL` / `STOP_LOSS` / `TAKE_PROFIT`);
 * `copy_trade_result` — `EXECUTED` или `SKIPPED` с `reason`;
 * `balance_updated` — `cash_balance` / `frozen_balance`.
@@ -291,8 +346,10 @@ asyncio.run(main())
 3. Пополняйте баланс через `POST /api/v1/portfolio/deposit`.
 4. Создавайте ордера/подписки от имени этого пользователя и проверяйте результат
    через REST и прямую проверку `trading.db` при необходимости.
+5. Если тест меняет стакан через `/api/v1/test/depth`, сбрасывайте оверрайд в
+   `finally` / `yield`-фикстуре (`DELETE /api/v1/test/depth`).
 
-Никаких общих мутаibles состояний и сбросов между тестами нет — каждый тест
+Никаких общих мутабельных состояний и сбросов между тестами нет — каждый тест
 работает со своим пользователем и своим бюджетом.
 
 ---
@@ -303,10 +360,10 @@ asyncio.run(main())
 app/               # код трейдинговой платформы (SUT)
   config.py        # настройки, константы, money(), JWT-хелперы
   database.py      # async engine, сессии, init_db()
-  models.py        # SQLAlchemy ORM-таблицы
+  models.py        # SQLAlchemy ORM-таблицы (включая trades)
   schemas.py       # Pydantic v2 схемы, BusinessError, WS-события
-  market_feed.py   # random-walk котировки каждые 500 мс
-  trading_engine.py  # балансы, ордера, GTC, SL/TP, копитрейдинг
+  market_feed.py   # random-walk котировки, синтетический/QA-стакан
+  trading_engine.py  # стакан, матчинг, комиссии, IOC/GTC, SL/TP, копитрейдинг
   ws_manager.py    # менеджер WS-подключений и FIFO-очередей
   main.py          # приложение, REST, WebSocket, OpenAPI
 requirements.txt
@@ -318,13 +375,13 @@ src/               # общая QA-инфраструктура
   fixtures/        # фабрики данных и поллинг без time.sleep()
   schemas/         # Pydantic-контракты (auth, copy-trading, websocket, order, market)
 tests/             # тесты по доменам
-  auth/  copy_trading/  websocket/
-  conftest.py      # Lifecycle SUT, изолированные пользователи
+  auth/  copy_trading/  orders/  websocket/
+  conftest.py      # Lifecycle SUT, изолированные пользователи, QA mode
   config.py        # настройки тестов с префиксом QA_
 ```
 
 ## Таблицы в `trading.db`
 
-`users`, `portfolios`, `transactions`, `positions`, `orders`,
+`users`, `portfolios`, `transactions`, `positions`, `orders`, `trades`,
 `copy_subscriptions`, `copy_trade_history`. Все денежные колонки —
 `NUMERIC(20, 8)`; включены `PRAGMA foreign_keys=ON` и `journal_mode=WAL`.

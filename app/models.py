@@ -129,15 +129,24 @@ class Order(Base):
     )
     ticker: Mapped[str] = mapped_column(String(16), nullable=False)
     side: Mapped[str] = mapped_column(String(8), nullable=False)  # BUY | SELL
+    order_type: Mapped[str] = mapped_column(
+        String(8), default="LIMIT", nullable=False
+    )  # LIMIT | MARKET
     amount: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    filled_qty: Mapped[Decimal] = mapped_column(Money, default=ZERO, nullable=False)
+    remaining_qty: Mapped[Decimal] = mapped_column(Money, default=ZERO, nullable=False)
     min_price: Mapped[Decimal] = mapped_column(Money, nullable=False)
     max_price: Mapped[Decimal] = mapped_column(Money, nullable=False)
     time_in_force: Mapped[str] = mapped_column(String(8), nullable=False)  # IOC | GTC
     stop_loss: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     take_profit: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="PENDING", nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="NEW", nullable=False)
     filled_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     reserved_amount: Mapped[Decimal] = mapped_column(
+        Money, default=ZERO, nullable=False
+    )
+    fee_amount: Mapped[Decimal] = mapped_column(Money, default=ZERO, nullable=False)
+    price_improvement: Mapped[Decimal] = mapped_column(
         Money, default=ZERO, nullable=False
     )
     reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -156,6 +165,32 @@ class Order(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="orders")
+
+
+class Trade(Base):
+    """Audit record for one maker/taker match (synthetic makers have no id)."""
+
+    __tablename__ = "trades"
+    __table_args__ = (Index("ix_trades_ticker_created", "ticker", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(16), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    maker_order_id: Mapped[int | None] = mapped_column(
+        ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    taker_order_id: Mapped[int | None] = mapped_column(
+        ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    price: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    fee: Mapped[Decimal] = mapped_column(Money, default=ZERO, nullable=False)
+    price_improvement: Mapped[Decimal] = mapped_column(
+        Money, default=ZERO, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
 
 
 class CopySubscription(Base):

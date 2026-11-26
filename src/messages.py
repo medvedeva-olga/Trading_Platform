@@ -27,5 +27,6 @@ class ErrCodes:
     MASTER_ID_IMMUTABLE = "MASTER_ID_IMMUTABLE"
     INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"
 
+
 class OrderError:
     MIN_PRICE_GR_MAX = "Value error, min_price must be less than or equal to max_price"

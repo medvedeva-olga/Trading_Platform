@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -21,6 +22,7 @@ from .models import (
     Order,
     Portfolio,
     Position,
+    Trade,
     Transaction,
     User,
 )
@@ -47,6 +49,18 @@ if TYPE_CHECKING:
     from .ws_manager import ConnectionManager
 
 logger = logging.getLogger(__name__)
+
+ACTIVE_STATUSES = ("NEW", "PARTIALLY_FILLED")
+UNBOUNDED = Decimal("1E30")
+
+
+@dataclass(frozen=True)
+class BookLevel:
+    """One executable price level (``order_id`` is None for synthetic liquidity)."""
+
+    price: Decimal
+    quantity: Decimal
+    order_id: int | None = None
 
 
 def now() -> datetime:
@@ -113,6 +127,9 @@ class TradingEngine:
             side=order.side,
             status=status,
             price=money(price) if price is not None else None,
+            filled_qty=money(order.filled_qty),
+            fee_amount=money(order.fee_amount),
+            price_improvement=money(order.price_improvement),
             reason=reason,
             timestamp=now(),
         )
@@ -268,6 +285,191 @@ class TradingEngine:
     # ------------------------------------------------------------------
     # Orders
     # ------------------------------------------------------------------
+    @staticmethod
+    def _fee(price: Decimal, quantity: Decimal) -> Decimal:
+        return money(price * quantity * settings.fee_rate)
+
+    async def _book_levels(
+        self, session: AsyncSession, ticker: str, side: str
+    ) -> list[BookLevel]:
+        """Executable levels for a taker of ``side``, best price first."""
+        bids, asks = self.feed.get_depth(ticker)
+        source = asks if side == "BUY" else bids
+        maker_side = "SELL" if side == "BUY" else "BUY"
+        levels = [
+            BookLevel(money(price), money(quantity))
+            for price, quantity in source
+            if money(quantity) > ZERO
+        ]
+        rows = await session.scalars(
+            select(Order)
+            .where(
+                Order.ticker == ticker,
+                Order.side == maker_side,
+                Order.status.in_(ACTIVE_STATUSES),
+            )
+            .order_by(
+                (
+                    Order.min_price.asc()
+                    if maker_side == "SELL"
+                    else Order.max_price.desc()
+                ),
+                Order.id.asc(),
+            )
+        )
+        for maker in rows:
+            remaining = money(maker.remaining_qty)
+            if remaining <= ZERO:
+                continue
+            price = (
+                money(maker.min_price)
+                if maker_side == "SELL"
+                else money(maker.max_price)
+            )
+            levels.append(BookLevel(price, remaining, maker.id))
+
+        reverse = side == "SELL"
+        levels.sort(
+            key=lambda level: (
+                -level.price if reverse else level.price,
+                level.order_id or 0,
+            )
+        )
+        return levels
+
+    async def _apply_fill(
+        self,
+        session: AsyncSession,
+        order: Order,
+        price: Decimal,
+        quantity: Decimal,
+        *,
+        limit_price: Decimal | None = None,
+    ) -> list[Any]:
+        """Execute part of an order, update the ledger and return WS events."""
+        price = money(price)
+        quantity = money(quantity)
+        remaining_before = money(order.remaining_qty)
+        if quantity <= ZERO or remaining_before <= ZERO:
+            return []
+
+        portfolio = await self._portfolio(session, order.user_id)
+        reserved = money(order.reserved_amount)
+        release = money(reserved * quantity / remaining_before)
+        if release > ZERO:
+            portfolio.frozen_balance = money(portfolio.frozen_balance - release)
+            portfolio.cash_balance = money(portfolio.cash_balance + release)
+            order.reserved_amount = money(reserved - release)
+
+        fee = self._fee(price, quantity)
+        improvement = ZERO
+        events: list[Any] = []
+        if order.side == "BUY":
+            cost = money(price * quantity)
+            if portfolio.cash_balance < money(cost + fee):
+                raise BusinessError(
+                    "INSUFFICIENT_FUNDS",
+                    "Not enough free balance to fill the buy order.",
+                    details={
+                        "required": str(money(cost + fee)),
+                        "available": str(money(portfolio.cash_balance)),
+                    },
+                )
+            portfolio.cash_balance = money(portfolio.cash_balance - cost - fee)
+            position = await self._position(session, order.user_id, order.ticker)
+            new_quantity = money(position.quantity + quantity)
+            position.avg_entry_price = (
+                money(
+                    (position.quantity * position.avg_entry_price + cost) / new_quantity
+                )
+                if new_quantity > ZERO
+                else ZERO
+            )
+            position.quantity = new_quantity
+            if order.stop_loss is not None:
+                position.stop_loss = money(order.stop_loss)
+            if order.take_profit is not None:
+                position.take_profit = money(order.take_profit)
+            position.source_order_id = order.id
+            tx_amount = -(cost + fee)
+            tx_type = "ORDER_BUY"
+            note = f"BUY {quantity} {order.ticker} @ {price} (fee {fee})"
+            if limit_price is not None:
+                improvement = money(max(ZERO, limit_price - price) * quantity)
+        else:
+            position = await self._position(session, order.user_id, order.ticker)
+            if position.quantity < quantity:
+                raise BusinessError(
+                    "INSUFFICIENT_POSITION",
+                    "Long position was reduced before the order could be filled.",
+                )
+            proceeds = money(price * quantity)
+            realized = money(quantity * (price - position.avg_entry_price))
+            entry_price = money(position.avg_entry_price)
+            portfolio.cash_balance = money(portfolio.cash_balance + proceeds - fee)
+            portfolio.realized_pnl = money(portfolio.realized_pnl + realized)
+            position.quantity = money(position.quantity - quantity)
+            closed = position.quantity == ZERO
+            if closed:
+                position.avg_entry_price = ZERO
+                position.stop_loss = None
+                position.take_profit = None
+                position.source_order_id = None
+            tx_amount = proceeds - fee
+            tx_type = "ORDER_SELL"
+            note = f"SELL {quantity} {order.ticker} @ {price} (fee {fee})"
+            if limit_price is not None:
+                improvement = money(max(ZERO, price - limit_price) * quantity)
+            if closed:
+                events.append(
+                    PositionClosedEvent(
+                        user_id=order.user_id,
+                        order_id=order.id,
+                        ticker=order.ticker,
+                        quantity=quantity,
+                        entry_price=entry_price,
+                        exit_price=price,
+                        pnl=realized,
+                        reason="MANUAL",
+                        timestamp=now(),
+                    )
+                )
+
+        session.add(
+            Transaction(
+                user_id=order.user_id,
+                type=tx_type,
+                amount=money(tx_amount),
+                balance_after=money(portfolio.cash_balance),
+                note=note,
+            )
+        )
+        filled_before = money(order.filled_qty)
+        filled_after = money(filled_before + quantity)
+        weighted = (
+            money(
+                ((order.filled_price or ZERO) * filled_before + price * quantity)
+                / filled_after
+            )
+            if filled_after > ZERO
+            else price
+        )
+        order.filled_qty = filled_after
+        order.remaining_qty = money(remaining_before - quantity)
+        order.filled_price = weighted
+        order.fee_amount = money(order.fee_amount + fee)
+        order.price_improvement = money(order.price_improvement + improvement)
+        order.updated_at = now()
+        if order.remaining_qty == ZERO:
+            order.status = "FILLED"
+            order.filled_at = now()
+            order.reason = None
+        else:
+            order.status = "PARTIALLY_FILLED"
+        events.append(self._order_event(order, order.status, price, order.reason))
+        events.append(self._balance_event(portfolio, order.user_id, "ORDER_FILLED"))
+        return events
+
     async def create_order(
         self, user_id: int, data: OrderCreateRequest
     ) -> OrderResponse:
@@ -286,17 +488,27 @@ class TradingEngine:
                 raise BusinessError("USER_NOT_FOUND", "User does not exist.", 404)
             portfolio = await self._portfolio(session, user_id)
             quote = self.feed.get_quote(data.ticker)
-            execution_price = quote.ask if data.side == "BUY" else quote.bid
-            required = ZERO
+            order_type = data.order_type or "LIMIT"
+            is_market = order_type == "MARKET"
+            floor = ZERO if is_market else money(data.min_price)
+            cap = UNBOUNDED if is_market else money(data.max_price)
+            reserve_price = (
+                quote.ask
+                if data.side == "BUY" and (is_market or data.time_in_force == "IOC")
+                else (
+                    cap
+                    if data.side == "BUY"
+                    else (
+                        quote.bid
+                        if is_market or data.time_in_force == "IOC"
+                        else money(data.min_price)
+                    )
+                )
+            )
 
             if data.side == "BUY":
                 required = money(
-                    amount
-                    * (
-                        execution_price
-                        if data.time_in_force == "IOC"
-                        else data.max_price
-                    )
+                    amount * reserve_price * (Decimal(1) + settings.fee_rate)
                 )
                 if portfolio.cash_balance < required:
                     raise BusinessError(
@@ -327,7 +539,7 @@ class TradingEngine:
                         },
                     )
                 # USDT-equivalent reservation, used only for the frozen_balance display.
-                required = money(amount * data.min_price)
+                required = money(amount * reserve_price)
                 if portfolio.cash_balance < required:
                     raise BusinessError(
                         "INSUFFICIENT_FUNDS",
@@ -342,7 +554,10 @@ class TradingEngine:
                 user_id=user_id,
                 ticker=data.ticker,
                 side=data.side,
+                order_type=order_type,
                 amount=amount,
+                filled_qty=ZERO,
+                remaining_qty=amount,
                 min_price=money(data.min_price),
                 max_price=money(data.max_price),
                 time_in_force=data.time_in_force,
@@ -350,38 +565,99 @@ class TradingEngine:
                 take_profit=(
                     money(data.take_profit) if data.take_profit is not None else None
                 ),
-                status="PENDING",
+                status="NEW",
                 reserved_amount=ZERO,
             )
             session.add(order)
             await session.flush()
 
             events: list[Any] = []
-            in_range = order.min_price <= execution_price <= order.max_price
-            if in_range:
+            taker_limit = None if is_market else (cap if data.side == "BUY" else floor)
+            for level in await self._book_levels(session, data.ticker, data.side):
+                if order.remaining_qty <= ZERO:
+                    break
+                if level.price < floor or level.price > cap:
+                    continue
+                fill_qty = min(order.remaining_qty, level.quantity)
+                fee_before = money(order.fee_amount)
+                improvement_before = money(order.price_improvement)
                 events.extend(
-                    await self._fill_order_locked(session, order, execution_price)
-                )
-            elif data.time_in_force == "IOC":
-                order.status = "CANCELED"
-                order.reason = "IOC_OUT_OF_RANGE"
-                order.updated_at = now()
-                events.append(
-                    self._order_event(
-                        order, "CANCELED", execution_price, "IOC_OUT_OF_RANGE"
+                    await self._apply_fill(
+                        session,
+                        order,
+                        level.price,
+                        fill_qty,
+                        limit_price=taker_limit,
                     )
                 )
-            else:
-                portfolio.cash_balance = money(portfolio.cash_balance - required)
-                portfolio.frozen_balance = money(portfolio.frozen_balance + required)
-                order.reserved_amount = required
-                order.reason = "AWAITING_RANGE"
-                events.append(self._balance_event(portfolio, user_id, "ORDER_RESERVED"))
-                events.append(
-                    self._order_event(
-                        order, "PENDING", execution_price, "AWAITING_RANGE"
+                if level.order_id is not None and level.order_id != order.id:
+                    maker = await session.get(Order, level.order_id)
+                    if maker is not None:
+                        maker_limit = (
+                            money(maker.min_price)
+                            if maker.side == "SELL"
+                            else money(maker.max_price)
+                        )
+                        events.extend(
+                            await self._apply_fill(
+                                session,
+                                maker,
+                                level.price,
+                                fill_qty,
+                                limit_price=maker_limit,
+                            )
+                        )
+                session.add(
+                    Trade(
+                        ticker=order.ticker,
+                        side=order.side,
+                        maker_order_id=level.order_id,
+                        taker_order_id=order.id,
+                        price=money(level.price),
+                        quantity=money(fill_qty),
+                        fee=money(order.fee_amount - fee_before),
+                        price_improvement=money(
+                            order.price_improvement - improvement_before
+                        ),
                     )
                 )
+
+            if order.remaining_qty > ZERO:
+                if data.time_in_force == "IOC":
+                    order.status = "CANCELED"
+                    order.reason = (
+                        "IOC_PARTIALLY_FILLED"
+                        if order.filled_qty > ZERO
+                        else "IOC_OUT_OF_RANGE"
+                    )
+                    order.updated_at = now()
+                    events.append(
+                        self._order_event(order, "CANCELED", None, order.reason)
+                    )
+                else:
+                    rest_price = cap if data.side == "BUY" else floor
+                    reserve = (
+                        money(
+                            order.remaining_qty
+                            * rest_price
+                            * (Decimal(1) + settings.fee_rate)
+                        )
+                        if data.side == "BUY"
+                        else money(order.remaining_qty * rest_price)
+                    )
+                    portfolio.cash_balance = money(portfolio.cash_balance - reserve)
+                    portfolio.frozen_balance = money(portfolio.frozen_balance + reserve)
+                    order.reserved_amount = reserve
+                    order.status = (
+                        "PARTIALLY_FILLED" if order.filled_qty > ZERO else "NEW"
+                    )
+                    order.reason = "AWAITING_RANGE"
+                    events.append(
+                        self._balance_event(portfolio, user_id, "ORDER_RESERVED")
+                    )
+                    events.append(
+                        self._order_event(order, order.status, None, "AWAITING_RANGE")
+                    )
 
             await session.commit()
             for event in events:
@@ -428,7 +704,7 @@ class TradingEngine:
                 raise BusinessError("ORDER_NOT_FOUND", "Order does not exist.", 404)
             if order.user_id != user_id:
                 raise BusinessError("FORBIDDEN", "Order belongs to another user.", 403)
-            if order.status != "PENDING":
+            if order.status not in ACTIVE_STATUSES:
                 raise BusinessError(
                     "ORDER_NOT_CANCELABLE", f"Order is already {order.status}."
                 )
@@ -464,102 +740,17 @@ class TradingEngine:
     async def _fill_order_locked(
         self, session: AsyncSession, order: Order, price: Decimal
     ) -> list[Any]:
-        """Fill an order, mutate ledger/position and return events to publish."""
-        price = money(price)
-        amount = money(order.amount)
-        portfolio = await self._portfolio(session, order.user_id)
-        reserved = money(order.reserved_amount)
-
-        if reserved > ZERO:
-            portfolio.frozen_balance = money(portfolio.frozen_balance - reserved)
-            portfolio.cash_balance = money(portfolio.cash_balance + reserved)
-
-        events: list[Any] = []
-        if order.side == "BUY":
-            cost = money(amount * price)
-            if portfolio.cash_balance < cost:
-                raise BusinessError(
-                    "INSUFFICIENT_FUNDS",
-                    "Not enough free balance to fill the buy order.",
-                    details={
-                        "required": str(cost),
-                        "available": str(money(portfolio.cash_balance)),
-                    },
-                )
-            portfolio.cash_balance = money(portfolio.cash_balance - cost)
-            position = await self._position(session, order.user_id, order.ticker)
-            new_quantity = money(position.quantity + amount)
-            position.avg_entry_price = (
-                money(
-                    (position.quantity * position.avg_entry_price + cost) / new_quantity
-                )
-                if new_quantity > ZERO
-                else ZERO
-            )
-            position.quantity = new_quantity
-            if order.stop_loss is not None:
-                position.stop_loss = money(order.stop_loss)
-            if order.take_profit is not None:
-                position.take_profit = money(order.take_profit)
-            position.source_order_id = order.id
-            tx_amount = -cost
-            tx_type = "ORDER_BUY"
-            note = f"BUY {amount} {order.ticker} @ {price}"
-        else:
-            position = await self._position(session, order.user_id, order.ticker)
-            if position.quantity < amount:
-                raise BusinessError(
-                    "INSUFFICIENT_POSITION",
-                    "Long position was reduced before the order could be filled.",
-                )
-            proceeds = money(amount * price)
-            realized = money(amount * (price - position.avg_entry_price))
-            entry_price = money(position.avg_entry_price)
-            portfolio.cash_balance = money(portfolio.cash_balance + proceeds)
-            portfolio.realized_pnl = money(portfolio.realized_pnl + realized)
-            position.quantity = money(position.quantity - amount)
-            closed = position.quantity == ZERO
-            if closed:
-                position.avg_entry_price = ZERO
-                position.stop_loss = None
-                position.take_profit = None
-                position.source_order_id = None
-            tx_amount = proceeds
-            tx_type = "ORDER_SELL"
-            note = f"SELL {amount} {order.ticker} @ {price}"
-            if closed:
-                events.append(
-                    PositionClosedEvent(
-                        user_id=order.user_id,
-                        order_id=order.id,
-                        ticker=order.ticker,
-                        quantity=amount,
-                        entry_price=entry_price,
-                        exit_price=price,
-                        pnl=realized,
-                        reason="MANUAL",
-                        timestamp=now(),
-                    )
-                )
-
-        session.add(
-            Transaction(
-                user_id=order.user_id,
-                type=tx_type,
-                amount=money(tx_amount),
-                balance_after=money(portfolio.cash_balance),
-                note=note,
-            )
+        """Fill the whole remaining quantity (used by copy orders)."""
+        limit = (
+            money(order.max_price) if order.side == "BUY" else money(order.min_price)
         )
-        order.status = "FILLED"
-        order.filled_price = price
-        order.filled_at = now()
-        order.updated_at = now()
-        order.reason = None
-
-        events.append(self._order_event(order, "FILLED", price))
-        events.append(self._balance_event(portfolio, order.user_id, "ORDER_FILLED"))
-        return events
+        return await self._apply_fill(
+            session,
+            order,
+            price,
+            money(order.remaining_qty),
+            limit_price=limit,
+        )
 
     async def _close_position_locked(
         self,
@@ -608,20 +799,74 @@ class TradingEngine:
         ]
 
     async def handle_tick(self, ticker: str, quote: Quote) -> None:
-        """Evaluate GTC orders and SL/TP levels on every market tick."""
+        """Match resting orders against the book and evaluate SL/TP levels."""
         async with self._lock, SessionLocal() as session:
             events: list[Any] = []
             master_fills: list[dict[str, Any]] = []
 
-            pending = await session.scalars(
-                select(Order).where(Order.status == "PENDING", Order.ticker == ticker)
+            resting = await session.scalars(
+                select(Order).where(
+                    Order.status.in_(ACTIVE_STATUSES), Order.ticker == ticker
+                )
             )
-            for order in pending:
-                execution_price = quote.ask if order.side == "BUY" else quote.bid
-                if order.min_price <= execution_price <= order.max_price:
+            for order in resting:
+                is_market = order.order_type == "MARKET"
+                floor = ZERO if is_market else money(order.min_price)
+                cap = UNBOUNDED if is_market else money(order.max_price)
+                taker_limit = (
+                    None if is_market else (cap if order.side == "BUY" else floor)
+                )
+                for level in await self._book_levels(session, ticker, order.side):
+                    if order.remaining_qty <= ZERO:
+                        break
+                    if level.price < floor or level.price > cap:
+                        continue
+                    if level.order_id == order.id:
+                        continue
+                    fill_qty = min(order.remaining_qty, level.quantity)
+                    fee_before = money(order.fee_amount)
+                    improvement_before = money(order.price_improvement)
                     events.extend(
-                        await self._fill_order_locked(session, order, execution_price)
+                        await self._apply_fill(
+                            session,
+                            order,
+                            level.price,
+                            fill_qty,
+                            limit_price=taker_limit,
+                        )
                     )
+                    if level.order_id is not None:
+                        maker = await session.get(Order, level.order_id)
+                        if maker is not None:
+                            maker_limit = (
+                                money(maker.min_price)
+                                if maker.side == "SELL"
+                                else money(maker.max_price)
+                            )
+                            events.extend(
+                                await self._apply_fill(
+                                    session,
+                                    maker,
+                                    level.price,
+                                    fill_qty,
+                                    limit_price=maker_limit,
+                                )
+                            )
+                    session.add(
+                        Trade(
+                            ticker=order.ticker,
+                            side=order.side,
+                            maker_order_id=level.order_id,
+                            taker_order_id=order.id,
+                            price=money(level.price),
+                            quantity=money(fill_qty),
+                            fee=money(order.fee_amount - fee_before),
+                            price_improvement=money(
+                                order.price_improvement - improvement_before
+                            ),
+                        )
+                    )
+                if order.status == "FILLED":
                     user = await session.get(User, order.user_id)
                     if user is not None and user.role == "MASTER" and not order.is_copy:
                         master_fills.append(
@@ -631,7 +876,7 @@ class TradingEngine:
                                 "ticker": order.ticker,
                                 "side": order.side,
                                 "amount": money(order.amount),
-                                "price": money(execution_price),
+                                "price": money(order.filled_price),
                                 "master_equity": await self._master_equity(
                                     order.user_id
                                 ),
@@ -1071,11 +1316,14 @@ class TradingEngine:
                         user_id=slave.id,
                         ticker=snapshot["ticker"],
                         side=snapshot["side"],
+                        order_type="LIMIT",
                         amount=amount,
+                        filled_qty=ZERO,
+                        remaining_qty=amount,
                         min_price=copy_price,
                         max_price=copy_price,
                         time_in_force="IOC",
-                        status="PENDING",
+                        status="NEW",
                         reserved_amount=ZERO,
                         is_copy=True,
                         copy_of_order_id=snapshot["master_order_id"],

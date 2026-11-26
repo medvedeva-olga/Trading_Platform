@@ -4,7 +4,8 @@ Run locally::
 
     uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
-All state lives in ``trading.db``; no artificial reset/test endpoints exist.
+All state lives in ``trading.db``; QA-only depth overrides are available when
+``TRADING_QA_MODE=true``.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from .config import TICKERS, create_access_token, decode_access_token, settings
+from .config import TICKERS, create_access_token, decode_access_token, money, settings
 from .database import close_engine, init_db
 from .market_feed import MarketFeed, Quote
 from .schemas import (
@@ -39,6 +40,8 @@ from .schemas import (
     CopyTradeResultEvent,
     DepositRequest,
     DepositResponse,
+    DepthOverride,
+    DepthResponse,
     ErrorResponse,
     LoginRequest,
     MasterStats,
@@ -116,9 +119,26 @@ APP_DESCRIPTION = """
 2. `POST /api/v1/auth/login` — получите JWT (HS256).
 3. `POST /api/v1/portfolio/deposit` — пополните баланс (100 … 1 000 000 USDT).
 4. `GET /api/v1/market/tickers` — возьмите текущие Bid/Ask и постройте ценовой коридор.
-5. `POST /api/v1/orders` — выставьте `IOC` (немедленно) или `GTC` (ожидание диапазона).
-6. `POST /api/v1/copy-trading/subscribe` — подпишите `SLAVE` на `MASTER`.
-7. `GET /api/v1/copy-trading/history` — проверьте `EXECUTED` / `SKIPPED` и причину.
+5. `GET /api/v1/market/depth?ticker=BTCUSDT` — посмотрите лучшие уровни стакана.
+6. `POST /api/v1/orders` — выставьте `LIMIT` (лимит по коридору) или `MARKET`
+   (исполнение по лучшей цене стакана), с `IOC` или `GTC`.
+7. `POST /api/v1/copy-trading/subscribe` — подпишите `SLAVE` на `MASTER`.
+8. `GET /api/v1/copy-trading/history` — проверьте `EXECUTED` / `SKIPPED` и причину.
+
+## Стакан и исполнение
+
+* Ликвидность — синтетический стакан вокруг текущей котировки плюс активные
+  `NEW` / `PARTIALLY_FILLED` ордера. Приоритет — лучшая цена, затем время.
+* Частичное исполнение переводит ордер в `PARTIALLY_FILLED`; остаток `GTC`
+  остаётся в стакане с заморозкой, остаток `IOC` отменяется с причиной
+  `IOC_PARTIALLY_FILLED` / `IOC_OUT_OF_RANGE`.
+* Taker платит комиссию `fee_rate` (по умолчанию 0.1%). Исполнение дешевле лимита
+  BUY (или дороже лимита SELL) фиксируется в `price_improvement`.
+* Событие `order_status` дополнительно содержит `filled_qty`, `fee_amount`,
+  `price_improvement`; каждое совпадение записывается в таблицу `trades`.
+* Copy-trading запускается только при полном исполнении (`FILLED`) ордера Мастера.
+* При `TRADING_QA_MODE=true` доступны скрытые ручки `POST /api/v1/test/depth`
+  и `DELETE /api/v1/test/depth` для детерминированного стакана в тестах.
 
 ## WebSocket
 
@@ -137,7 +157,9 @@ APP_DESCRIPTION = """
 `TRADING_DATABASE_URL`, `TRADING_JWT_SECRET`, `TRADING_MARKET_REGIME`
 (`calm`/`normal`/`high`), `TRADING_MARKET_VOLATILITY`, `TRADING_MARKET_SEED`,
 `TRADING_SPREAD_BPS`, `TRADING_COPY_DELAY_MS` (мс задержки копирования;
-установите больше тика, чтобы детерминированно тестировать `SLIPPAGE_EXCEEDED`).
+установите больше тика, чтобы детерминированно тестировать `SLIPPAGE_EXCEEDED`),
+`TRADING_FEE_RATE` (комиссия тейкера), `TRADING_SYNTHETIC_DEPTH_QTY`,
+`TRADING_DEPTH_LEVELS`, `TRADING_QA_MODE`.
 """
 
 app = FastAPI(
@@ -148,7 +170,7 @@ app = FastAPI(
     openapi_tags=[
         {"name": "auth", "description": "Регистрация и выдача JWT."},
         {"name": "portfolio", "description": "Депозиты, балансы, позиции и PnL."},
-        {"name": "market", "description": "Текущие котировки четырёх тикеров."},
+        {"name": "market", "description": "Котировки четырёх тикеров и стакан."},
         {"name": "orders", "description": "Создание, отмена и история ордеров."},
         {
             "name": "copy-trading",
@@ -293,6 +315,57 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def require_qa_mode() -> None:
+    """Hide test-only endpoints unless the SUT is explicitly started in QA mode."""
+    if not settings.qa_mode:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+@app.post(
+    "/api/v1/test/depth",
+    response_model=DepthResponse,
+    tags=["system"],
+    summary="QA: задать детерминированный стакан",
+    include_in_schema=False,
+)
+async def set_depth(
+    payload: DepthOverride,
+    feed: FeedDep,
+    _: None = Depends(require_qa_mode),
+) -> DepthResponse:
+    feed.set_depth(
+        payload.ticker,
+        [(money(price), money(qty)) for price, qty in payload.bids],
+        [(money(price), money(qty)) for price, qty in payload.asks],
+    )
+    bids, asks = feed.get_depth(payload.ticker)
+    return DepthResponse(
+        ticker=payload.ticker,
+        bids=bids,
+        asks=asks,
+        timestamp=feed.get_quote(payload.ticker).timestamp,
+    )
+
+
+@app.delete(
+    "/api/v1/test/depth",
+    tags=["system"],
+    summary="QA: вернуть синтетический стакан",
+    include_in_schema=False,
+)
+async def reset_depth(
+    feed: FeedDep,
+    ticker: str | None = Query(default=None),
+    _: None = Depends(require_qa_mode),
+) -> dict[str, str]:
+    if ticker is not None and ticker not in TICKERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid ticker"
+        )
+    feed.reset_depth(ticker)
+    return {"status": "ok"}
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -390,6 +463,33 @@ async def tickers(feed: FeedDep) -> list[TickerQuote]:
     ]
 
 
+@app.get(
+    "/api/v1/market/depth",
+    response_model=DepthResponse,
+    tags=["market"],
+    summary="Стакан: лучшие bid/ask с объёмами",
+    description=(
+        "Объединяет синтетическую ликвидность и resting-ордера. "
+        "Параметр `limit` ограничивает число уровней с каждой стороны."
+    ),
+    responses=errors(400),
+)
+async def depth(
+    feed: FeedDep,
+    ticker: str = Query(default="BTCUSDT"),
+    limit: int = Query(default=5, ge=1, le=20),
+) -> DepthResponse:
+    if ticker not in TICKERS:
+        raise BusinessError("INVALID_TICKER", f"Unsupported ticker: {ticker}")
+    bids, asks = feed.get_depth(ticker)
+    return DepthResponse(
+        ticker=ticker,
+        bids=bids[:limit],
+        asks=asks[:limit],
+        timestamp=feed.get_quote(ticker).timestamp,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Orders
 # ---------------------------------------------------------------------------
@@ -398,11 +498,13 @@ async def tickers(feed: FeedDep) -> list[TickerQuote]:
     response_model=OrderResponse,
     status_code=status.HTTP_201_CREATED,
     tags=["orders"],
-    summary="Создать ордер (IOC или GTC)",
+    summary="Создать ордер (LIMIT/MARKET, IOC/GTC)",
     description=(
-        "`IOC` исполняется немедленно либо отменяется с `reason=IOC_OUT_OF_RANGE`. "
-        "`GTC` вне коридора замораживает сумму в `frozen_balance` до попадания цены в диапазон "
-        "или до отмены ордера."
+        "`LIMIT` исполняется только в коридоре `min_price..max_price`, `MARKET` — по лучшей "
+        "цене стакана. Частичное исполнение даёт `PARTIALLY_FILLED`; остаток `IOC` отменяется "
+        "с `reason=IOC_PARTIALLY_FILLED` / `IOC_OUT_OF_RANGE`, остаток `GTC` остаётся в стакане "
+        "с заморозкой в `frozen_balance`. Тейкер платит комиссию `fee_rate`; разница с лимитом "
+        "фиксируется в `price_improvement`."
     ),
     responses=errors(400, 401, 403, 404, 422),
 )
