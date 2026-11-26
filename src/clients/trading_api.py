@@ -65,6 +65,14 @@ class TradingAPIClient:
             "/api/v1/orders", headers=self.headers, json=payload
         )
 
+    async def get_order(self, order_id: int) -> httpx.Response:
+        return await self._http.get(f"/api/v1/orders/{order_id}", headers=self.headers)
+
+    async def cancel_order(self, order_id: int) -> httpx.Response:
+        return await self._http.delete(
+            f"/api/v1/orders/{order_id}", headers=self.headers
+        )
+
     async def masters(self) -> httpx.Response:
         return await self._http.get(
             "/api/v1/copy-trading/masters", headers=self.headers

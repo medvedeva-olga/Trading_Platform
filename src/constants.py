@@ -40,6 +40,10 @@ class OrderSide(StrEnum):
     SELL = "SELL"
 
 
+class TimeInForce(StrEnum):
+    IOC = "IOC"
+    GTC ="GTC"
+
 class SkipReason(StrEnum):
     SLIPPAGE_EXCEEDED = "SLIPPAGE_EXCEEDED"
     INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"

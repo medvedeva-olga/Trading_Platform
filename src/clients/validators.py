@@ -86,3 +86,15 @@ def expect_error(response: httpx.Response, expected: str, status: int = 400) -> 
         assert (
             detail == expected
         ), f"Ожидалось сообщение об ошибке {expected!r}, получено {detail!r}: {body}"
+
+
+def expect_validation_error(response, msg, status = 400):
+    expect_status(response, status)
+    body = response.json()
+    assert isinstance(
+        body, dict
+    ), f"Ожидался JSON-объект, получен {type(body).__name__}"
+    detail = body.get("detail")
+    assert detail is not None, "Ожидалось сообщение {msg!r}, получено {}"
+    assert isinstance(detail, list) and len(detail) > 0 , "Ожидался непустой список"
+    assert detail[0].get("msg") == msg, f"Ожидалось сообщение {msg!r}, получено {detail!r}: {body}"
